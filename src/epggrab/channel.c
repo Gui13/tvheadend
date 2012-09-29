@@ -18,6 +18,7 @@
 
 #include <assert.h>
 #include <string.h>
+#include <strings.h> // strcasecmp
 
 #include "tvheadend.h"
 #include "settings.h"
@@ -38,7 +39,7 @@ int epggrab_channel_match ( epggrab_channel_t *ec, channel_t *ch )
   if (!ec || !ch) return 0;
   if (LIST_FIRST(&ec->channels)) return 0; // ignore already paired
 
-  if (ec->name && !strcmp(ec->name, ch->ch_name)) return 1;
+  if (ec->name && !strcasecmp(ec->name, ch->ch_name)) return 1;
   return 0;
 }
 
