@@ -23,6 +23,7 @@
 #include <regex.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <time.h>
 
 #include "tvheadend.h"
 #include "queue.h"
@@ -38,6 +39,9 @@
 #define EPG_HASH_WIDTH 1024
 #define EPG_HASH_MASK  (EPG_HASH_WIDTH - 1)
 
+/* Objects tree */
+epg_object_tree_t epg_objects[EPG_HASH_WIDTH];
+
 /* URI lists */
 epg_object_tree_t epg_brands;
 epg_object_tree_t epg_seasons;
@@ -45,16 +49,28 @@ epg_object_tree_t epg_episodes;
 epg_object_tree_t epg_serieslinks;
 
 /* Other special case lists */
-epg_object_list_t epg_objects[EPG_HASH_WIDTH];
 epg_object_list_t epg_object_unref;
 epg_object_list_t epg_object_updated;
 
 /* Global counter */
 static uint32_t _epg_object_idx    = 0;
 
+/*
+ *
+ */
+static inline epg_object_tree_t *epg_id_tree( epg_object_t *eo )
+{
+  return &epg_objects[eo->id & EPG_HASH_MASK];
+}
+
 /* **************************************************************************
  * Comparators / Ordering
  * *************************************************************************/
+
+static int _id_cmp ( const void *a, const void *b )
+{
+  return ((epg_object_t*)a)->id - ((epg_object_t*)b)->id;
+}
 
 static int _uri_cmp ( const void *a, const void *b )
 {
@@ -100,8 +116,8 @@ void epg_updated ( void )
 
   /* Remove unref'd */
   while ((eo = LIST_FIRST(&epg_object_unref))) {
-    tvhlog(LOG_DEBUG, "epg",
-           "unref'd object %u (%s) created during update", eo->id, eo->uri);
+    tvhtrace("epg",
+             "unref'd object %u (%s) created during update", eo->id, eo->uri);
     LIST_REMOVE(eo, un_link);
     eo->destroy(eo);
   }
@@ -126,23 +142,19 @@ static void _epg_object_destroy
   ( epg_object_t *eo, epg_object_tree_t *tree )
 {
   assert(eo->refcount == 0);
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] destroy",
-         eo, eo->id, eo->type, eo->uri);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] destroy",
+           eo, eo->id, eo->type, eo->uri);
   if (eo->uri) free(eo->uri);
   if (tree) RB_REMOVE(tree, eo, uri_link);
   if (eo->_updated) LIST_REMOVE(eo, up_link);
-  LIST_REMOVE(eo, id_link);
+  RB_REMOVE(epg_id_tree(eo), eo, id_link);
 }
 
 static void _epg_object_getref ( void *o )
 {
   epg_object_t *eo = o;
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] getref %d",
-         eo, eo->id, eo->type, eo->uri, eo->refcount+1);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] getref %d",
+           eo, eo->id, eo->type, eo->uri, eo->refcount+1);
   if (eo->refcount == 0) LIST_REMOVE(eo, un_link);
   eo->refcount++;
 }
@@ -150,10 +162,8 @@ static void _epg_object_getref ( void *o )
 static void _epg_object_putref ( void *o )
 {
   epg_object_t *eo = o;
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] putref %d",
-         eo, eo->id, eo->type, eo->uri, eo->refcount-1);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] putref %d",
+           eo, eo->id, eo->type, eo->uri, eo->refcount-1);
   assert(eo->refcount>0);
   eo->refcount--;
   if (!eo->refcount) eo->destroy(eo);
@@ -163,10 +173,8 @@ static void _epg_object_set_updated ( void *o )
 {
   epg_object_t *eo = o;
   if (!eo->_updated) {
-#ifdef EPG_TRACE
-    tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] updated",
-           eo, eo->id, eo->type, eo->uri);
-#endif
+    tvhtrace("epg", "eo [%p, %u, %d, %s] updated",
+             eo, eo->id, eo->type, eo->uri);
     eo->_updated = 1;
     eo->updated  = dispatch_clock;
     LIST_INSERT_HEAD(&epg_object_updated, eo, up_link);
@@ -176,17 +184,25 @@ static void _epg_object_set_updated ( void *o )
 static void _epg_object_create ( void *o )
 {
   epg_object_t *eo = o;
+  uint32_t id = eo->id;
+  if (!id) eo->id = ++_epg_object_idx;
   if (!eo->id) eo->id = ++_epg_object_idx;
-  else if (eo->id > _epg_object_idx) _epg_object_idx = eo->id;
   if (!eo->getref) eo->getref = _epg_object_getref;
   if (!eo->putref) eo->putref = _epg_object_putref;
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] created",
-         eo, eo->id, eo->type, eo->uri);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] created",
+           eo, eo->id, eo->type, eo->uri);
   _epg_object_set_updated(eo);
   LIST_INSERT_HEAD(&epg_object_unref, eo, un_link);
-  LIST_INSERT_HEAD(&epg_objects[eo->id & EPG_HASH_MASK], eo, id_link);
+  while (1) {
+    if (!RB_INSERT_SORTED(epg_id_tree(eo), eo, id_link, _id_cmp))
+      break;
+    if (id) {
+      tvherror("epg", "fatal error, duplicate EPG ID");
+      abort();
+    }
+    eo->id = ++_epg_object_idx;
+    if (!eo->id) eo->id = ++_epg_object_idx;
+  }
 }
 
 static epg_object_t *_epg_object_find_by_uri 
@@ -220,21 +236,19 @@ static epg_object_t *_epg_object_find_by_uri
 
 epg_object_t *epg_object_find_by_id ( uint32_t id, epg_object_type_t type )
 {
-  epg_object_t *eo;
-  LIST_FOREACH(eo, &epg_objects[id & EPG_HASH_MASK], id_link) {
-    if (eo->id == id)
-      return ((type == EPG_UNDEF) || (eo->type == type)) ? eo : NULL;
-  }
+  epg_object_t *eo, temp;
+  temp.id = id;
+  eo = RB_FIND(epg_id_tree(&temp), &temp, id_link, _id_cmp);
+  if (eo && eo->type == type)
+    return eo;
   return NULL;
 }
 
 static htsmsg_t * _epg_object_serialize ( void *o )
 {
   epg_object_t *eo = o;
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] serialize",
-         eo, eo->id, eo->type, eo->uri);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] serialize",
+           eo, eo->id, eo->type, eo->uri);
   htsmsg_t *m;
   if ( !eo->id || !eo->type ) return NULL;
   m = htsmsg_create_map();
@@ -263,10 +277,8 @@ static epg_object_t *_epg_object_deserialize ( htsmsg_t *m, epg_object_t *eo )
     _epg_object_set_updated(eo);
     eo->updated = s64;
   }
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] deserialize",
-         eo, eo->id, eo->type, eo->uri);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] deserialize",
+           eo, eo->id, eo->type, eo->uri);
   return eo;
 }
 
@@ -518,6 +530,8 @@ htsmsg_t *epg_brand_serialize ( epg_brand_t *brand )
     lang_str_serialize(brand->summary, m, "summary");
   if (brand->season_count)
     htsmsg_add_u32(m, "season-count", brand->season_count);
+  if (brand->image)
+    htsmsg_add_str(m, "image", brand->image);
   return m;
 }
 
@@ -526,6 +540,7 @@ epg_brand_t *epg_brand_deserialize ( htsmsg_t *m, int create, int *save )
   epg_object_t **skel = _epg_brand_skel();
   epg_brand_t *eb;
   uint32_t u32;
+  const char *str;
   lang_str_t *ls;
   lang_str_ele_t *e;
 
@@ -544,6 +559,9 @@ epg_brand_t *epg_brand_deserialize ( htsmsg_t *m, int create, int *save )
   }
   if ( !htsmsg_get_u32(m, "season-count", &u32) )
     *save |= epg_brand_set_season_count(eb, u32, NULL);
+
+  if ( (str = htsmsg_get_str(m, "image")) )
+    *save |= epg_brand_set_image(eb, str, NULL);
 
   return eb;
 }
@@ -700,6 +718,8 @@ htsmsg_t *epg_season_serialize ( epg_season_t *season )
     htsmsg_add_u32(m, "episode-count", season->episode_count);
   if (season->brand)
     htsmsg_add_str(m, "brand", season->brand->uri);
+  if (season->image)
+    htsmsg_add_str(m, "image", season->image);
   return m;
 }
 
@@ -730,6 +750,9 @@ epg_season_t *epg_season_deserialize ( htsmsg_t *m, int create, int *save )
   if ( (str = htsmsg_get_str(m, "brand")) )
     if ( (eb = epg_brand_find_by_uri(str, 0, NULL)) )
       *save |= epg_season_set_brand(es, eb, NULL);
+
+  if ( (str = htsmsg_get_str(m, "image")) )
+    *save |= epg_season_set_image(es, str, NULL);
 
   return es;
 }
@@ -767,16 +790,15 @@ static htsmsg_t *epg_episode_num_serialize ( epg_episode_num_t *num )
   return m;
 }
 
-static epg_episode_num_t *epg_episode_num_deserialize 
+static void epg_episode_num_deserialize 
   ( htsmsg_t *m, epg_episode_num_t *num )
 {
   const char *str;
   uint32_t u32;
-  if (!m) return NULL;
-  if (!num)
-    num = calloc(1, sizeof(epg_episode_num_t));
-  else
-    memset(num, 0, sizeof(epg_episode_num_t));
+  assert(m && num);
+
+  memset(num, 0, sizeof(epg_episode_num_t));
+
   if (!htsmsg_get_u32(m, "e_num", &u32))
     num->e_num = u32;
   if (!htsmsg_get_u32(m, "e_cnt", &u32))
@@ -791,7 +813,6 @@ static epg_episode_num_t *epg_episode_num_deserialize
     num->p_cnt = u32;
   if ((str = htsmsg_get_str(m, "text")))
     num->text = strdup(str);
-  return num;
 }
 
 static void _epg_episode_destroy ( void *eo )
@@ -1080,19 +1101,19 @@ size_t epg_episode_number_format
   epg_episode_num_t num;
   epg_episode_get_epnum(episode, &num);
   if ( num.e_num ) {
-    if (pre) i += snprintf(&buf[i], len-i, "%s", pre);
+    if (pre) tvh_strlcatf(buf, len, i, "%s", pre);
     if ( sfmt && num.s_num ) {
-      i += snprintf(&buf[i], len-i, sfmt, num.s_num);
+      tvh_strlcatf(buf, len, i, sfmt, num.s_num);
       if ( cfmt && num.s_cnt )
-        i += snprintf(&buf[i], len-i, cfmt, num.s_cnt);
-      if (sep) i += snprintf(&buf[i], len-i, "%s", sep);
+        tvh_strlcatf(buf, len, i, cfmt, num.s_cnt);
+      if (sep) tvh_strlcatf(buf, len, i, "%s", sep);
     }
-    i += snprintf(&buf[i], len-i, efmt, num.e_num);
+    tvh_strlcatf(buf, len, i, efmt, num.e_num);
     if ( cfmt && num.e_cnt )
-      i+= snprintf(&buf[i], len-i, cfmt, num.e_cnt);
+      tvh_strlcatf(buf, len, i, cfmt, num.e_cnt);
   } else if ( num.text ) {
-    if (pre) i += snprintf(&buf[i], len-i, "%s", pre);
-    i += snprintf(&buf[i], len-i, "%s", num.text);
+    if (pre) tvh_strlcatf(buf, len, i, "%s", pre);
+    tvh_strlcatf(buf, len, i, "%s", num.text);
   }
   return i;
 }
@@ -1168,6 +1189,9 @@ htsmsg_t *epg_episode_serialize ( epg_episode_t *episode )
     htsmsg_add_u32(m, "age_rating", episode->age_rating);
   if (episode->first_aired)
     htsmsg_add_s64(m, "first_aired", episode->first_aired);
+  if (episode->image)
+    htsmsg_add_str(m, "image", episode->image);
+
   return m;
 }
 
@@ -1245,6 +1269,9 @@ epg_episode_t *epg_episode_deserialize ( htsmsg_t *m, int create, int *save )
   if (!htsmsg_get_s64(m, "first_aired", &s64))
     *save |= epg_episode_set_first_aired(ee, (time_t)s64, NULL);
 
+  if ( (str = htsmsg_get_str(m, "image")) )
+    *save |= epg_episode_set_image(ee, str, NULL);
+
   return ee;
 }
 
@@ -1262,7 +1289,7 @@ const char *epg_episode_get_subtitle
   return lang_str_get(e->subtitle, lang);
 }
 
-const char *epg_episode_get_summary 
+const char *epg_episode_get_summary
   ( const epg_episode_t *e, const char *lang )
 {
   if (!e || !e->summary) return NULL;
@@ -1391,8 +1418,9 @@ static void _epg_channel_timer_callback ( void *p )
 
     /* Expire */
     if ( ebc->stop <= dispatch_clock ) {
-      tvhlog(LOG_DEBUG, "epg", "expire event %u from %s",
-             ebc->id, ch->ch_name);
+      tvhlog(LOG_DEBUG, "epg", "expire event %u (%s) from %s",
+             ebc->id, epg_broadcast_get_title(ebc, NULL),
+             channel_get_name(ch));
       _epg_channel_rem_broadcast(ch, ebc, NULL);
       continue; // skip to next
 
@@ -1410,25 +1438,22 @@ static void _epg_channel_timer_callback ( void *p )
     break;
   }
   
-  /* Change */
-  if (cur != ch->ch_epg_now || nxt != ch->ch_epg_next)
+  /* Change (update HTSP) */
+  if (cur != ch->ch_epg_now || nxt != ch->ch_epg_next) {
     tvhlog(LOG_DEBUG, "epg", "now/next %u/%u set on %s",
            ch->ch_epg_now  ? ch->ch_epg_now->id : 0,
            ch->ch_epg_next ? ch->ch_epg_next->id : 0,
-           ch->ch_name);
+           channel_get_name(ch));
+    tvhlog(LOG_DEBUG, "epg", "inform HTSP of now event change on %s",
+           channel_get_name(ch));
+    htsp_channel_update_nownext(ch);
+  }
 
   /* re-arm */
   if ( next ) {
     tvhlog(LOG_DEBUG, "epg", "arm channel timer @ %"PRItime_t" for %s",
-           next, ch->ch_name);
+           next, channel_get_name(ch));
     gtimer_arm_abs(&ch->ch_epg_timer, _epg_channel_timer_callback, ch, next);
-  }
-
-  /* Update HTSP */
-  if ( cur != ch->ch_epg_now ) {
-    tvhlog(LOG_DEBUG, "epg", "inform HTSP of now event change on %s",
-           ch->ch_name);
-    htsp_channel_update_current(ch);
   }
 
   /* Remove refs */
@@ -1461,6 +1486,9 @@ static epg_broadcast_t *_epg_channel_add_broadcast
       _epg_object_create(ret);
       // Note: sets updated
       _epg_object_getref(ret);
+      tvhtrace("epg", "added event %u (%s) on %s @ %"PRItime_t " to %"PRItime_t,
+               ret->id, epg_broadcast_get_title(ret, NULL),
+               channel_get_name(ch), ret->start, ret->stop);
 
     /* Existing */
     } else {
@@ -1474,6 +1502,9 @@ static epg_broadcast_t *_epg_channel_add_broadcast
       } else {
         ret->stop = (*bcast)->stop;
         _epg_object_set_updated(ret);
+        tvhtrace("epg", "updated event %u (%s) on %s @ %"PRItime_t " to %"PRItime_t,
+                 ret->id, epg_broadcast_get_title(ret, NULL),
+                 channel_get_name(ch), ret->start, ret->stop);
       }
     }
   }
@@ -1484,12 +1515,18 @@ static epg_broadcast_t *_epg_channel_add_broadcast
   /* Remove overlapping (before) */
   while ( (ebc = RB_PREV(ret, sched_link)) != NULL ) {
     if ( ebc->stop <= ret->start ) break;
+    tvhtrace("epg", "remove overlap (b) event %u (%s) on %s @ %"PRItime_t " to %"PRItime_t,
+             ebc->id, epg_broadcast_get_title(ebc, NULL),
+             channel_get_name(ch), ebc->start, ebc->stop);
     _epg_channel_rem_broadcast(ch, ebc, ret);
   }
 
   /* Remove overlapping (after) */
   while ( (ebc = RB_NEXT(ret, sched_link)) != NULL ) {
     if ( ebc->start >= ret->stop ) break;
+    tvhtrace("epg", "remove overlap (a) event %u (%s) on %s @ %"PRItime_t " to %"PRItime_t,
+             ebc->id, epg_broadcast_get_title(ebc, NULL),
+             channel_get_name(ch), ebc->start, ebc->stop);
     _epg_channel_rem_broadcast(ch, ebc, ret);
   }
 
@@ -1571,10 +1608,8 @@ epg_broadcast_t* epg_broadcast_find_by_time
   return _epg_channel_add_broadcast(channel, ebc, create, save);
 }
 
-epg_broadcast_t *epg_broadcast_find_by_id ( uint32_t id, channel_t *ch )
+epg_broadcast_t *epg_broadcast_find_by_id ( uint32_t id )
 {
-  // Note: I have left channel_t param, just in case I decide to change
-  //       to use it for shorter search
   return (epg_broadcast_t*)epg_object_find_by_id(id, EPG_BROADCAST);
 }
 
@@ -1727,8 +1762,8 @@ epg_episode_t *epg_broadcast_get_episode
   if (!ebc) return NULL;
   if (ebc->episode) return ebc->episode;
   if (!create) return NULL;
-  snprintf(uri, sizeof(uri)-1, "tvh://channel-%d/bcast-%u/episode",
-           ebc->channel->ch_id, ebc->id);
+  snprintf(uri, sizeof(uri)-1, "tvh://channel-%s/bcast-%u/episode",
+           idnode_uuid_as_str(&ebc->channel->ch_id), ebc->id);
   if ((ee = epg_episode_find_by_uri(uri, 1, save)))
     *save |= epg_broadcast_set_episode(ebc, ee, ebc->grabber);
   return ee;
@@ -1738,6 +1773,12 @@ const char *epg_broadcast_get_title ( epg_broadcast_t *b, const char *lang )
 {
   if (!b || !b->episode) return NULL;
   return epg_episode_get_title(b->episode, lang);
+}
+
+const char *epg_broadcast_get_subtitle ( epg_broadcast_t *b, const char *lang )
+{
+  if (!b || !b->episode) return NULL;
+  return epg_episode_get_subtitle(b->episode, lang);
 }
 
 const char *epg_broadcast_get_summary ( epg_broadcast_t *b, const char *lang )
@@ -1762,7 +1803,7 @@ htsmsg_t *epg_broadcast_serialize ( epg_broadcast_t *broadcast )
   htsmsg_add_s64(m, "stop", broadcast->stop);
   htsmsg_add_str(m, "episode", broadcast->episode->uri);
   if (broadcast->channel)
-    htsmsg_add_u32(m, "channel", broadcast->channel->ch_id);
+    htsmsg_add_str(m, "channel", channel_get_uuid(broadcast->channel));
   if (broadcast->dvb_eid)
     htsmsg_add_u32(m, "dvb_eid", broadcast->dvb_eid);
   if (broadcast->is_widescreen)
@@ -1802,7 +1843,7 @@ epg_broadcast_t *epg_broadcast_deserialize
   epg_serieslink_t *esl;
   lang_str_t *ls;
   const char *str;
-  uint32_t chid, eid, u32;
+  uint32_t eid, u32;
   int64_t start, stop;
 
   if ( htsmsg_get_s64(m, "start", &start) ) return NULL;
@@ -1824,9 +1865,8 @@ epg_broadcast_t *epg_broadcast_deserialize
   }
 
   /* Get channel */
-  if ( !htsmsg_get_u32(m, "channel", &chid) ) {
-    ch  = channel_find_by_identifier(chid);
-  }
+  if ((str = htsmsg_get_str(m, "channel")))
+    ch = channel_find(str);
   if (!ch) return NULL;
 
   /* Create */
@@ -1885,153 +1925,153 @@ epg_broadcast_t *epg_broadcast_deserialize
 static const char *_epg_genre_names[16][16] = {
   { "" },
   {
-    "Movie/Drama",
-    "detective/thriller",
-    "adventure/western/war",
-    "science fiction/fantasy/horror",
-    "comedy",
-    "soap/melodrama/folkloric",
-    "romance",
-    "serious/classical/religious/historical movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
+    "Movie / Drama",
+    "Detective / Thriller",
+    "Adventure / Western / War",
+    "Science fiction / Fantasy / Horror",
+    "Comedy",
+    "Soap / Melodrama / Folkloric",
+    "Romance",
+    "Serious / Classical / Religious / Historical movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
   },
   {
-    "News/Current affairs",
-    "news/weather report",
-    "news magazine",
-    "documentary",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
+    "News / Current affairs",
+    "News / Weather report",
+    "News magazine",
+    "Documentary",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
   },
   {
-    "Show/Game show",
-    "game show/quiz/contest",
-    "variety show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
+    "Show / Game show",
+    "Game show / Quiz / Contest",
+    "Variety show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
   },
   {
     "Sports",
-    "special events (Olympic Games, World Cup, etc.)",
-    "sports magazines",
-    "football/soccer",
-    "tennis/squash",
-    "team sports (excluding football)",
-    "athletics",
-    "motor sport",
-    "water sport",
+    "Special events (Olympic Games, World Cup, etc.)",
+    "Sports magazines",
+    "Football / Soccer",
+    "Tennis / Squash",
+    "Team sports (excluding football)",
+    "Athletics",
+    "Motor sport",
+    "Water sport",
   },
   {
-    "Children's/Youth programmes",
-    "pre-school children's programmes",
-    "entertainment programmes for 6 to14",
-    "entertainment programmes for 10 to 16",
-    "informational/educational/school programmes",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
+    "Children's / Youth programmes",
+    "Pre-school children's programmes",
+    "Entertainment programmes for 6 to 14",
+    "Entertainment programmes for 10 to 16",
+    "Informational / Educational / School programmes",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
   },
   {
-    "Music/Ballet/Dance",
-    "rock/pop",
-    "serious music/classical music",
-    "folk/traditional music",
-    "jazz",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
+    "Music / Ballet / Dance",
+    "Rock / Pop",
+    "Serious music / Classical music",
+    "Folk / Traditional music",
+    "Jazz",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
   },
   {
-    "Arts/Culture (without music)",
-    "performing arts",
-    "fine arts",
-    "religion",
-    "popular culture/traditional arts",
-    "literature",
-    "film/cinema",
-    "experimental film/video",
-    "broadcasting/press",
+    "Arts / Culture (without music)",
+    "Performing arts",
+    "Fine arts",
+    "Religion",
+    "Popular culture / Traditional arts",
+    "Literature",
+    "Film / Cinema",
+    "Experimental film / Video",
+    "Broadcasting / Press",
   },
   {
-    "Social/Political issues/Economics",
-    "magazines/reports/documentary",
-    "economics/social advisory",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
+    "Social / Political issues / Economics",
+    "Magazines / Reports / Documentary",
+    "Economics / Social advisory",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
   },
   {
-    "Education/Science/Factual topics",
-    "nature/animals/environment",
-    "technology/natural sciences",
-    "medicine/physiology/psychology",
-    "foreign countries/expeditions",
-    "social/spiritual sciences",
-    "further education",
-    "languages",
-    "languages",
-    "languages",
-    "languages",
-    "languages",
-    "languages",
-    "languages",
+    "Education / Science / Factual topics",
+    "Nature / Animals / Environment",
+    "Technology / Natural sciences",
+    "Medicine / Physiology / Psychology",
+    "Foreign countries / Expeditions",
+    "Social / Spiritual sciences",
+    "Further education",
+    "Languages",
+    "Languages",
+    "Languages",
+    "Languages",
+    "Languages",
+    "Languages",
+    "Languages",
   },
   {
     "Leisure hobbies",
-    "tourism/travel",
-    "handicraft",
-    "motoring",
-    "fitness and health",
-    "cooking",
-    "advertisement/shopping",
-    "gardening",
-    "gardening",
-    "gardening",
-    "gardening",
-    "gardening",
-    "gardening",
-    "gardening",
+    "Tourism / Travel",
+    "Handicraft",
+    "Motoring",
+    "Fitness and health",
+    "Cooking",
+    "Advertisement / Shopping",
+    "Gardening",
+    "Gardening",
+    "Gardening",
+    "Gardening",
+    "Gardening",
+    "Gardening",
+    "Gardening",
   }
 };
 
@@ -2078,12 +2118,11 @@ size_t epg_genre_get_str ( const epg_genre_t *genre, int major_only,
   if (!_epg_genre_names[maj][0]) return 0;
   min = major_only ? 0 : (genre->code & 0xf);
   if (!min || major_prefix ) {
-    ret = snprintf(buf, len, "%s", _epg_genre_names[maj][0]);
-    if (min) ret += snprintf(buf+ret, len-ret, " : ");
+    tvh_strlcatf(buf, len, ret, "%s", _epg_genre_names[maj][0]);
+    if (min) tvh_strlcatf(buf, len, ret, " : ");
   }
-  if (min && _epg_genre_names[maj][min]) {
-    ret += snprintf(buf+ret, len-ret, "%s", _epg_genre_names[maj][min]);
-  }
+  if (min && _epg_genre_names[maj][min])
+    tvh_strlcatf(buf, len, ret, "%s", _epg_genre_names[maj][min]);
   return ret;
 }
 
@@ -2179,8 +2218,8 @@ htsmsg_t *epg_genres_list_all ( int major_only, int major_prefix )
     for (j = 0; j < (major_only ? 1 : 16); j++) {
       if (_epg_genre_names[i][j]) {
         e = htsmsg_create_map();
-        htsmsg_add_u32(e, "code", i << 4 | j);
-        htsmsg_add_str(e, "name", _epg_genre_names[i][j]);
+        htsmsg_add_u32(e, "key", (i << 4) | (major_only ? 0 : j));
+        htsmsg_add_str(e, "val", _epg_genre_names[i][j]);
         // TODO: use major_prefix
         htsmsg_add_msg(m, NULL, e);
       }
@@ -2193,115 +2232,446 @@ htsmsg_t *epg_genres_list_all ( int major_only, int major_prefix )
  * Querying
  * *************************************************************************/
 
-static void _eqr_add 
-  ( epg_query_result_t *eqr, epg_broadcast_t *e,
-    epg_genre_t *genre, regex_t *preg, time_t start, const char *lang )
+static inline int
+_eq_comp_num ( epg_filter_num_t *f, int64_t val )
 {
-  const char *title;
-
-  /* Ignore */
-  if ( e->stop < start ) return;
-  if ( !(title = epg_episode_get_title(e->episode, lang)) ) return;
-  if ( genre && !epg_genre_list_contains(&e->episode->genre, genre, 1) ) return;
-  if ( preg && regexec(preg, title, 0, NULL, 0)) return;
-
-  /* More space */
-  if ( eqr->eqr_entries == eqr->eqr_alloced ) {
-    eqr->eqr_alloced = MAX(100, eqr->eqr_alloced * 2);
-    eqr->eqr_array   = realloc(eqr->eqr_array, 
-                               eqr->eqr_alloced * sizeof(epg_broadcast_t));
+  switch (f->comp) {
+    case EC_EQ: return val != f->val1;
+    case EC_LT: return val > f->val1;
+    case EC_GT: return val < f->val1;
+    case EC_RG: return val < f->val1 || val > f->val2;
+    default: return 0;
   }
-  
-  /* Store */
-  eqr->eqr_array[eqr->eqr_entries++] = e;
 }
 
-static void _eqr_add_channel 
-  ( epg_query_result_t *eqr, channel_t *ch, epg_genre_t *genre,
-    regex_t *preg, time_t start, const char *lang )
+static inline int
+_eq_comp_str ( epg_filter_str_t *f, const char *str )
+{
+  switch (f->comp) {
+    case EC_EQ: return strcmp(str, f->str);
+    case EC_LT: return strcmp(str, f->str) > 0;
+    case EC_GT: return strcmp(str, f->str) < 0;
+    case EC_IN: return strstr(str, f->str) != NULL;
+    case EC_RE: return regexec(&f->re, str, 0, NULL, 0) != 0;
+    default: return 0;
+  }
+}
+
+static void
+_eq_add ( epg_query_t *eq, epg_broadcast_t *e )
+{
+  const char *s, *lang = eq->lang;
+  epg_episode_t *ep;
+  int fulltext = eq->stitle && eq->fulltext;
+
+  /* Filtering */
+  if (e == NULL) return;
+  if (e->stop < dispatch_clock) return;
+  if (_eq_comp_num(&eq->start, e->start)) return;
+  if (_eq_comp_num(&eq->stop, e->stop)) return;
+  if (eq->duration.comp != EC_NO) {
+    int64_t duration = (int64_t)e->stop - (int64_t)e->start;
+    if (_eq_comp_num(&eq->duration, duration)) return;
+  }
+  ep = e->episode;
+  if (eq->stars.comp != EC_NO)
+    if (_eq_comp_num(&eq->stars, ep->star_rating)) return;
+  if (eq->age.comp != EC_NO)
+    if (_eq_comp_num(&eq->age, ep->age_rating)) return;
+  if (eq->channel_num.comp != EC_NO)
+    if (_eq_comp_num(&eq->channel_num, channel_get_number(e->channel))) return;
+  if (eq->channel_name.comp != EC_NO)
+    if (_eq_comp_str(&eq->channel_name, channel_get_name(e->channel))) return;
+  if (eq->genre_count) {
+    epg_genre_t genre;
+    uint32_t i, r = 0;
+    for (i = 0; i < eq->genre_count; i++) {
+      genre.code = eq->genre[i];
+      if (genre.code == 0) continue;
+      if (epg_genre_list_contains(&e->episode->genre, &genre, 1)) r++;
+    }
+    if (!r) return;
+  }
+  if (fulltext) {
+    if ((s = epg_episode_get_title(ep, lang)) == NULL ||
+        regexec(&eq->stitle_re, s, 0, NULL, 0)) {
+      if ((s = epg_episode_get_subtitle(ep, lang)) == NULL ||
+          regexec(&eq->stitle_re, s, 0, NULL, 0)) {
+        if ((s = epg_broadcast_get_summary(e, lang)) == NULL ||
+            regexec(&eq->stitle_re, s, 0, NULL, 0)) {
+          if ((s = epg_broadcast_get_description(e, lang)) == NULL ||
+              regexec(&eq->stitle_re, s, 0, NULL, 0)) {
+            return;
+          }
+        }
+      }
+    }
+  }
+  if (eq->title.comp != EC_NO || (eq->stitle && !fulltext)) {
+    if ((s = epg_episode_get_title(ep, lang)) == NULL) return;
+    if (eq->stitle && !fulltext && regexec(&eq->stitle_re, s, 0, NULL, 0)) return;
+    if (eq->title.comp != EC_NO && _eq_comp_str(&eq->title, s)) return;
+  }
+  if (eq->subtitle.comp != EC_NO) {
+    if ((s = epg_episode_get_subtitle(ep, lang)) == NULL) return;
+    if (_eq_comp_str(&eq->subtitle, s)) return;
+  }
+  if (eq->summary.comp != EC_NO) {
+    if ((s = epg_broadcast_get_summary(e, lang)) == NULL) return;
+    if (_eq_comp_str(&eq->summary, s)) return;
+  }
+  if (eq->description.comp != EC_NO) {
+    if ((s = epg_broadcast_get_description(e, lang)) == NULL) return;
+    if (_eq_comp_str(&eq->description, s)) return;
+  }
+
+  /* More space */
+  if (eq->entries == eq->allocated) {
+    eq->allocated = MAX(100, eq->allocated + 100);
+    eq->result    = realloc(eq->result, eq->allocated * sizeof(epg_broadcast_t *));
+  }
+
+  /* Store */
+  eq->result[eq->entries++] = e;
+}
+
+static void
+_eq_add_channel ( epg_query_t *eq, channel_t *ch )
 {
   epg_broadcast_t *ebc;
   RB_FOREACH(ebc, &ch->ch_epg_schedule, sched_link) {
-    if ( ebc->episode ) _eqr_add(eqr, ebc, genre, preg, start, lang);
+    if (ebc->episode)
+      _eq_add(eq, ebc);
   }
 }
 
-void epg_query0
-  ( epg_query_result_t *eqr, channel_t *channel, channel_tag_t *tag,
-    epg_genre_t *genre, const char *title, const char *lang )
+static int
+_eq_init_str( epg_filter_str_t *f )
 {
-  time_t now;
-  channel_tag_mapping_t *ctm;
-  regex_t preg0, *preg;
-  time(&now);
-
-  /* Clear (just incase) */
-  memset(eqr, 0, sizeof(epg_query_result_t));
-
-  /* Setup exp */
-  if ( title ) {
-    if (regcomp(&preg0, title, REG_ICASE | REG_EXTENDED | REG_NOSUB) )
-      return;
-    preg = &preg0;
-  } else {
-    preg = NULL;
-  }
-  
-  /* Single channel */
-  if (channel && !tag) {
-    _eqr_add_channel(eqr, channel, genre, preg, now, lang);
-  
-  /* Tag based */
-  } else if ( tag ) {
-    LIST_FOREACH(ctm, &tag->ct_ctms, ctm_tag_link) {
-      if(channel == NULL || ctm->ctm_channel == channel)
-        _eqr_add_channel(eqr, ctm->ctm_channel, genre, preg, now, lang);
-    }
-
-  /* All channels */
-  } else {
-    RB_FOREACH(channel, &channel_name_tree, ch_name_link) {
-      _eqr_add_channel(eqr, channel, genre, preg, now, lang);
-    }
-  }
-  if (preg) regfree(preg);
-
-  return;
+  if (f->comp != EC_RE) return 0;
+  return regcomp(&f->re, f->str, REG_ICASE | REG_EXTENDED | REG_NOSUB);
 }
 
-void epg_query(epg_query_result_t *eqr, const char *channel, const char *tag,
-	       epg_genre_t *genre, const char *title, const char *lang)
+static void
+_eq_done_str( epg_filter_str_t *f )
 {
-  channel_t     *ch = channel ? channel_find_by_name(channel, 0, 0) : NULL;
-  channel_tag_t *ct = tag     ? channel_tag_find_by_name(tag, 0)    : NULL;
-  epg_query0(eqr, ch, ct, genre, title, lang);
+  if (f->comp == EC_RE)
+    regfree(&f->re);
+  free(f->str);
+  f->str = NULL;
 }
 
-void epg_query_free(epg_query_result_t *eqr)
-{
-  free(eqr->eqr_array);
-}
-
-static int _epg_sort_start_ascending ( const void *a, const void *b )
+static int _epg_sort_start_ascending ( const void *a, const void *b, void *eq )
 {
   return (*(epg_broadcast_t**)a)->start - (*(epg_broadcast_t**)b)->start;
 }
 
-void epg_query_sort(epg_query_result_t *eqr)
+static int _epg_sort_start_descending ( const void *a, const void *b, void *eq )
 {
-  qsort(eqr->eqr_array, eqr->eqr_entries, sizeof(epg_broadcast_t*),
-        _epg_sort_start_ascending);
+  return (*(epg_broadcast_t**)b)->start - (*(epg_broadcast_t**)a)->start;
 }
+
+static int _epg_sort_stop_ascending ( const void *a, const void *b, void *eq )
+{
+  return (*(epg_broadcast_t**)a)->stop - (*(epg_broadcast_t**)b)->stop;
+}
+
+static int _epg_sort_stop_descending ( const void *a, const void *b, void *eq )
+{
+  return (*(epg_broadcast_t**)b)->stop - (*(epg_broadcast_t**)a)->stop;
+}
+
+static inline int64_t _epg_sort_duration( const epg_broadcast_t *b )
+{
+  return b->stop - b->start;
+}
+
+static int _epg_sort_duration_ascending ( const void *a, const void *b, void *eq )
+{
+  return _epg_sort_duration(*(epg_broadcast_t**)a) - _epg_sort_duration(*(epg_broadcast_t**)b);
+}
+
+static int _epg_sort_duration_descending ( const void *a, const void *b, void *eq )
+{
+  return _epg_sort_duration(*(epg_broadcast_t**)b) - _epg_sort_duration(*(epg_broadcast_t**)a);
+}
+
+static int _epg_sort_title_ascending ( const void *a, const void *b, void *eq )
+{
+  const char *s1 = epg_broadcast_get_title(*(epg_broadcast_t**)a, ((epg_query_t *)eq)->lang);
+  const char *s2 = epg_broadcast_get_title(*(epg_broadcast_t**)b, ((epg_query_t *)eq)->lang);
+  if (s1 == NULL && s2 == NULL) return 0;
+  if (s1 == NULL && s2) return 1;
+  if (s1 && s2 == NULL) return -1;
+  return strcmp(s1, s2);
+}
+
+static int _epg_sort_title_descending ( const void *a, const void *b, void *eq )
+{
+  return _epg_sort_title_ascending(a, b, eq) * -1;
+}
+
+static int _epg_sort_subtitle_ascending ( const void *a, const void *b, void *eq )
+{
+  const char *s1 = epg_broadcast_get_subtitle(*(epg_broadcast_t**)a, ((epg_query_t *)eq)->lang);
+  const char *s2 = epg_broadcast_get_subtitle(*(epg_broadcast_t**)b, ((epg_query_t *)eq)->lang);
+  if (s1 == NULL && s2 == NULL) return 0;
+  if (s1 == NULL && s2) return 1;
+  if (s1 && s2 == NULL) return -1;
+  return strcmp(s1, s2);
+}
+
+static int _epg_sort_subtitle_descending ( const void *a, const void *b, void *eq )
+{
+  return _epg_sort_subtitle_ascending(a, b, eq) * -1;
+}
+
+static int _epg_sort_summary_ascending ( const void *a, const void *b, void *eq )
+{
+  const char *s1 = epg_broadcast_get_summary(*(epg_broadcast_t**)a, ((epg_query_t *)eq)->lang);
+  const char *s2 = epg_broadcast_get_summary(*(epg_broadcast_t**)b, ((epg_query_t *)eq)->lang);
+  if (s1 == NULL && s2 == NULL) return 0;
+  if (s1 == NULL && s2) return 1;
+  if (s1 && s2 == NULL) return -1;
+  return strcmp(s1, s2);
+}
+
+static int _epg_sort_summary_descending ( const void *a, const void *b, void *eq )
+{
+  return _epg_sort_summary_ascending(a, b, eq) * -1;
+}
+
+static int _epg_sort_description_ascending ( const void *a, const void *b, void *eq )
+{
+  const char *s1 = epg_broadcast_get_description(*(epg_broadcast_t**)a, ((epg_query_t *)eq)->lang);
+  const char *s2 = epg_broadcast_get_description(*(epg_broadcast_t**)b, ((epg_query_t *)eq)->lang);
+  if (s1 == NULL && s2 == NULL) return 0;
+  if (s1 == NULL && s2) return 1;
+  if (s1 && s2 == NULL) return -1;
+  return strcmp(s1, s2);
+}
+
+static int _epg_sort_description_descending ( const void *a, const void *b, void *eq )
+{
+  return _epg_sort_description_ascending(a, b, eq) * -1;
+}
+
+static int _epg_sort_channel_ascending ( const void *a, const void *b, void *eq )
+{
+  char *s1 = strdup(channel_get_name((*(epg_broadcast_t**)a)->channel));
+  char *s2 = strdup(channel_get_name((*(epg_broadcast_t**)b)->channel));
+  int r = strcmp(s1, s2);
+  free(s2);
+  free(s1);
+  return r;
+}
+
+static int _epg_sort_channel_descending ( const void *a, const void *b, void *eq )
+{
+  return _epg_sort_description_ascending(a, b, eq) * -1;
+}
+
+static int _epg_sort_channel_num_ascending ( const void *a, const void *b, void *eq )
+{
+  int64_t v1 = channel_get_number((*(epg_broadcast_t**)a)->channel);
+  int64_t v2 = channel_get_number((*(epg_broadcast_t**)b)->channel);
+  return v1 - v2;
+}
+
+static int _epg_sort_channel_num_descending ( const void *a, const void *b, void *eq )
+{
+  int64_t v1 = channel_get_number((*(epg_broadcast_t**)a)->channel);
+  int64_t v2 = channel_get_number((*(epg_broadcast_t**)b)->channel);
+  return v2 - v1;
+}
+
+static int _epg_sort_stars_ascending ( const void *a, const void *b, void *eq )
+{
+  return (*(epg_broadcast_t**)a)->episode->star_rating - (*(epg_broadcast_t**)b)->episode->star_rating;
+}
+
+static int _epg_sort_stars_descending ( const void *a, const void *b, void *eq )
+{
+  return (*(epg_broadcast_t**)b)->episode->star_rating - (*(epg_broadcast_t**)a)->episode->star_rating;
+}
+
+static int _epg_sort_age_ascending ( const void *a, const void *b, void *eq )
+{
+  return (*(epg_broadcast_t**)a)->episode->age_rating - (*(epg_broadcast_t**)b)->episode->age_rating;
+}
+
+static int _epg_sort_age_descending ( const void *a, const void *b, void *eq )
+{
+  return (*(epg_broadcast_t**)b)->episode->age_rating - (*(epg_broadcast_t**)a)->episode->age_rating;
+}
+
+static uint64_t _epg_sort_genre_hash( epg_episode_t *ep )
+{
+  uint64_t h = 0, t;
+  epg_genre_t *g;
+
+  LIST_FOREACH(g, &ep->genre, link) {
+    t = h >> 28;
+    h <<= 8;
+    h += (uint64_t)g->code + t;
+  }
+  return h;
+}
+
+static int _epg_sort_genre_ascending ( const void *a, const void *b, void *eq )
+{
+  uint64_t v1 = _epg_sort_genre_hash((*(epg_broadcast_t**)a)->episode);
+  uint64_t v2 = _epg_sort_genre_hash((*(epg_broadcast_t**)b)->episode);
+  return v1 - v2;
+}
+
+static int _epg_sort_genre_descending ( const void *a, const void *b, void *eq )
+{
+  return _epg_sort_genre_ascending(a, b, eq) * -1;
+}
+
+epg_broadcast_t **
+epg_query ( epg_query_t *eq, access_t *perm )
+{
+  channel_t *channel;
+  channel_tag_t *tag;
+  int (*fcn)(const void *, const void *, void *) = NULL;
+
+  /* Setup exp */
+  if (_eq_init_str(&eq->title)) goto fin;
+  if (_eq_init_str(&eq->subtitle)) goto fin;
+  if (_eq_init_str(&eq->summary)) goto fin;
+  if (_eq_init_str(&eq->description)) goto fin;
+  if (_eq_init_str(&eq->channel_name)) goto fin;
+
+  if (eq->stitle)
+    if (regcomp(&eq->stitle_re, eq->stitle, REG_ICASE | REG_EXTENDED | REG_NOSUB))
+      goto fin;
+
+  channel = channel_find_by_uuid(eq->channel) ?:
+            channel_find_by_name(eq->channel);
+
+  tag = channel_tag_find_by_uuid(eq->channel_tag) ?:
+        channel_tag_find_by_name(eq->channel_tag, 0);
+
+  /* Single channel */
+  if (channel && tag == NULL) {
+    if (channel_access(channel, perm, 0))
+      _eq_add_channel(eq, channel);
+  
+  /* Tag based */
+  } else if (tag) {
+    channel_tag_mapping_t *ctm;
+    channel_t *ch2;
+    LIST_FOREACH(ctm, &tag->ct_ctms, ctm_tag_link) {
+      ch2 = ctm->ctm_channel;
+      if(ch2 == channel || channel == NULL)
+        if (channel_access(ch2, perm, 0))
+          _eq_add_channel(eq, ch2);
+    }
+
+  /* All channels */
+  } else {
+    CHANNEL_FOREACH(channel)
+      if (channel_access(channel, perm, 0))
+        _eq_add_channel(eq, channel);
+  }
+
+  switch (eq->sort_dir) {
+  case ES_ASC:
+    switch (eq->sort_key) {
+    case ESK_START:       fcn = _epg_sort_start_ascending;        break;
+    case ESK_STOP:        fcn = _epg_sort_stop_ascending;         break;
+    case ESK_DURATION:    fcn = _epg_sort_duration_ascending;     break;
+    case ESK_TITLE:       fcn = _epg_sort_title_ascending;        break;
+    case ESK_SUBTITLE:    fcn = _epg_sort_subtitle_ascending;     break;
+    case ESK_SUMMARY:     fcn = _epg_sort_summary_ascending;      break;
+    case ESK_DESCRIPTION: fcn = _epg_sort_description_ascending;  break;
+    case ESK_CHANNEL:     fcn = _epg_sort_channel_ascending;      break;
+    case ESK_CHANNEL_NUM: fcn = _epg_sort_channel_num_ascending;  break;
+    case ESK_STARS:       fcn = _epg_sort_stars_ascending;        break;
+    case ESK_AGE:         fcn = _epg_sort_age_ascending;          break;
+    case ESK_GENRE:       fcn = _epg_sort_genre_ascending;        break;
+    }
+    break;
+  case ES_DSC:
+    switch (eq->sort_key) {
+    case ESK_START:       fcn = _epg_sort_start_descending;       break;
+    case ESK_STOP:        fcn = _epg_sort_stop_descending;        break;
+    case ESK_DURATION:    fcn = _epg_sort_duration_descending;    break;
+    case ESK_TITLE:       fcn = _epg_sort_title_descending;       break;
+    case ESK_SUBTITLE:    fcn = _epg_sort_subtitle_descending;    break;
+    case ESK_SUMMARY:     fcn = _epg_sort_summary_descending;     break;
+    case ESK_DESCRIPTION: fcn = _epg_sort_description_descending; break;
+    case ESK_CHANNEL:     fcn = _epg_sort_channel_descending;     break;
+    case ESK_CHANNEL_NUM: fcn = _epg_sort_channel_num_descending; break;
+    case ESK_STARS:       fcn = _epg_sort_stars_descending;       break;
+    case ESK_AGE:         fcn = _epg_sort_age_descending;         break;
+    case ESK_GENRE:       fcn = _epg_sort_genre_descending;       break;
+    }
+    break;
+  }
+
+  tvh_qsort_r(eq->result, eq->entries, sizeof(epg_broadcast_t *), fcn, eq);
+
+fin:
+  _eq_done_str(&eq->title);
+  _eq_done_str(&eq->subtitle);
+  _eq_done_str(&eq->summary);
+  _eq_done_str(&eq->description);
+  _eq_done_str(&eq->channel_name);
+
+  if (eq->stitle)
+    regfree(&eq->stitle_re);
+
+  free(eq->lang); eq->lang = NULL;
+  free(eq->channel); eq->channel = NULL;
+  free(eq->channel_tag); eq->channel_tag = NULL;
+  free(eq->stitle); eq->stitle = NULL;
+  if (eq->genre != eq->genre_static)
+    free(eq->genre);
+  eq->genre = NULL;
+
+  return eq->result;
+}
+
+void epg_query_free(epg_query_t *eq)
+{
+  free(eq->result); eq->result = NULL;
+}
+
 
 /* **************************************************************************
  * Miscellaneous
  * *************************************************************************/
 
-/* Hash title/summary/description to form URI */
-char *epg_hash ( const char *t, const char *s, const char *d )
+htsmsg_t *epg_config_serialize( void )
 {
-  if ( d && strlen(d) > 10 ) return md5sum(d);
-  if ( s && strlen(s) > 10 ) return md5sum(s);
-  if ( t ) return md5sum(t);
-  return NULL;
+  htsmsg_t *m = htsmsg_create_map();
+  htsmsg_add_u32(m, "last_id", _epg_object_idx);
+  return m;
+}
+
+int epg_config_deserialize( htsmsg_t *m )
+{
+  if (htsmsg_get_u32(m, "last_id", &_epg_object_idx))
+    return 0;
+  return 1; /* ok */
+}
+
+void epg_skel_done(void)
+{
+  epg_object_t **skel;
+  epg_broadcast_t **broad;
+
+  skel = _epg_brand_skel();
+  free(*skel); *skel = NULL;
+  skel = _epg_season_skel();
+  free(*skel); *skel = NULL;
+  skel = _epg_episode_skel();
+  free(*skel); *skel = NULL;
+  skel = _epg_serieslink_skel();
+  free(*skel); *skel = NULL;
+  broad = _epg_broadcast_skel();
+  free(*broad); *broad = NULL;
 }

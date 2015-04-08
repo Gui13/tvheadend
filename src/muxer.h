@@ -19,14 +19,49 @@
 #ifndef MUXER_H_
 #define MUXER_H_
 
+#include "htsmsg.h"
+
+#define MC_IS_EOS_ERROR(e) ((e) == EPIPE || (e) == ECONNRESET)
+
 typedef enum {
   MC_UNKNOWN     = 0,
   MC_MATROSKA    = 1,
   MC_MPEGTS      = 2,
   MC_MPEGPS      = 3,
   MC_PASS        = 4,
+  MC_RAW         = 5,
+  MC_WEBM        = 6,
+  MC_AVMATROSKA  = 7,
+  MC_AVWEBM      = 8,
 } muxer_container_type_t;
 
+typedef enum {
+  MC_CACHE_UNKNOWN      = 0,
+  MC_CACHE_SYSTEM       = 1,
+  MC_CACHE_DONTKEEP     = 2,
+  MC_CACHE_SYNC         = 3,
+  MC_CACHE_SYNCDONTKEEP = 4,
+  MC_CACHE_LAST         = MC_CACHE_SYNCDONTKEEP
+} muxer_cache_type_t;
+
+/* Muxer configuration used when creating a muxer. */
+typedef struct muxer_config {
+  int                  m_type; /* MC_* */
+
+  int                  m_rewrite_pat;
+  int                  m_rewrite_pmt;
+  int                  m_rewrite_sdt;
+  int                  m_rewrite_eit;
+  int                  m_cache;
+
+/* 
+ * directory_permissions should really be in dvr.h as it's not really needed for the muxer
+ * but it's kept with file_permissions for neatness
+ */
+
+  int                  m_file_permissions;
+  int                  m_directory_permissions; 
+} muxer_config_t;
 
 struct muxer;
 struct streaming_start;
@@ -46,13 +81,16 @@ typedef struct muxer {
 			       const struct streaming_start *);         // stream changes
   int         (*m_close)      (struct muxer *);                         // Close the muxer
   void        (*m_destroy)    (struct muxer *);                         // Free the memory
-  int         (*m_write_meta) (struct muxer *, struct epg_broadcast *); // Append epg data
+  int         (*m_write_meta) (struct muxer *, struct epg_broadcast *,
+                               const char *comment);                    // Append epg data
   int         (*m_write_pkt)  (struct muxer *,                          // Append a media packet
 			       streaming_message_type_t,
 			       void *);
+  int         (*m_add_marker) (struct muxer *);                         // Add a marker (or chapter)
 
+  int                    m_eos;        // End of stream
   int                    m_errors;     // Number of errors
-  muxer_container_type_t m_container;  // The type of the container
+  muxer_config_t         m_config;     // general configuration
 } muxer_t;
 
 
@@ -65,19 +103,48 @@ muxer_container_type_t muxer_container_mime2type (const char *str);
 
 const char*            muxer_container_suffix(muxer_container_type_t mc, int video);
 
+//int muxer_container_list(htsmsg_t *array);
+
 // Muxer factory
-muxer_t *muxer_create(muxer_container_type_t mc);
+muxer_t *muxer_create(const muxer_config_t *m_cfg);
 
 // Wrapper functions
-int         muxer_open_file   (muxer_t *m, const char *filename);
-int         muxer_open_stream (muxer_t *m, int fd);
-int         muxer_init        (muxer_t *m, const struct streaming_start *ss, const char *name);
-int         muxer_reconfigure (muxer_t *m, const struct streaming_start *ss);
-int         muxer_close       (muxer_t *m);
-int         muxer_destroy     (muxer_t *m);
-int         muxer_write_meta  (muxer_t *m, struct epg_broadcast *eb);
-int         muxer_write_pkt   (muxer_t *m, streaming_message_type_t smt, void *data);
-const char* muxer_mime        (muxer_t *m, const struct streaming_start *ss);
+static inline int muxer_open_file (muxer_t *m, const char *filename)
+  { if(m && filename) return m->m_open_file(m, filename); return -1; }
+
+static inline int muxer_open_stream (muxer_t *m, int fd)
+  { if(m && fd >= 0) return m->m_open_stream(m, fd); return -1; }
+
+static inline int muxer_init (muxer_t *m, const struct streaming_start *ss, const char *name)
+  { if(m && ss) return m->m_init(m, ss, name); return -1; }
+
+static inline int muxer_reconfigure (muxer_t *m, const struct streaming_start *ss)
+  { if(m && ss) return m->m_reconfigure(m, ss); return -1; }
+
+static inline int muxer_add_marker (muxer_t *m)
+  { if (m) return m->m_add_marker(m); return -1; }
+
+static inline int muxer_close (muxer_t *m)
+  { if (m) return m->m_close(m); return -1; }
+
+static inline int muxer_destroy (muxer_t *m)
+  { if (m) { m->m_destroy(m); return 0; } return -1; }
+
+static inline int muxer_write_meta (muxer_t *m, struct epg_broadcast *eb, const char *comment)
+  { if (m) return m->m_write_meta(m, eb, comment); return -1; }
+
+static inline int muxer_write_pkt (muxer_t *m, streaming_message_type_t smt, void *data)
+  { if (m && data) return m->m_write_pkt(m, smt, data); return -1; }
+
+static inline const char* muxer_mime (muxer_t *m, const struct streaming_start *ss)
+  { if (m && ss) return m->m_mime(m, ss); return NULL; }
+
 const char* muxer_suffix      (muxer_t *m, const struct streaming_start *ss);
+
+// Cache
+const char *       muxer_cache_type2txt(muxer_cache_type_t t);
+muxer_cache_type_t muxer_cache_txt2type(const char *str);
+void               muxer_cache_update(muxer_t *m, int fd, off_t off, size_t size);
+int                muxer_cache_list(htsmsg_t *array);
 
 #endif

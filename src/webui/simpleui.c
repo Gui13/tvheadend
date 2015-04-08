@@ -1,6 +1,6 @@
 /*
  *  tvheadend, WEBUI / HTML user interface
- *  Copyright (C) 2008 Andreas Öman
+ *  Copyright (C) 2008 Andreas ï¿½man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -51,6 +51,103 @@ const char *days[7] = {
   "Saturday",
 };
 
+typedef struct dvr_query_result {
+  dvr_entry_t **dqr_array;
+  int dqr_entries;
+  int dqr_alloced;
+} dvr_query_result_t;
+
+typedef int (dvr_entry_filter)(dvr_entry_t *entry);
+typedef int (dvr_entry_comparator)(const void *a, const void *b);
+
+/**
+ *
+ */
+static void
+dvr_query_add_entry(dvr_query_result_t *dqr, dvr_entry_t *de)
+{
+  if(dqr->dqr_entries == dqr->dqr_alloced) {
+    /* Need to alloc more space */
+
+    dqr->dqr_alloced = MAX(100, dqr->dqr_alloced * 2);
+    dqr->dqr_array = realloc(dqr->dqr_array,
+			     dqr->dqr_alloced * sizeof(dvr_entry_t *));
+  }
+  dqr->dqr_array[dqr->dqr_entries++] = de;
+}
+
+static void
+dvr_query_filter(dvr_query_result_t *dqr, dvr_entry_filter filter)
+{
+  dvr_entry_t *de;
+
+  memset(dqr, 0, sizeof(dvr_query_result_t));
+
+  LIST_FOREACH(de, &dvrentries, de_global_link)
+    if (filter(de))
+      dvr_query_add_entry(dqr, de);
+}
+
+static int all_filter(dvr_entry_t *entry)
+{
+  return 1;
+}
+
+/**
+ *
+ */
+static void
+dvr_query(dvr_query_result_t *dqr)
+{
+  return dvr_query_filter(dqr, all_filter);
+}
+
+/**
+ *
+ */
+static void
+dvr_query_free(dvr_query_result_t *dqr)
+{
+  free(dqr->dqr_array);
+}
+
+/**
+ * Sorting functions
+ */
+static int
+dvr_sort_start_descending(const void *A, const void *B)
+{
+  dvr_entry_t *a = *(dvr_entry_t **)A;
+  dvr_entry_t *b = *(dvr_entry_t **)B;
+  return b->de_start - a->de_start;
+}
+
+#if 0
+static int
+dvr_sort_start_ascending(const void *A, const void *B)
+{
+  return -dvr_sort_start_descending(A, B);
+}
+#endif
+
+/**
+ *
+ */
+static void
+dvr_query_sort_cmp(dvr_query_result_t *dqr, dvr_entry_comparator sf)
+{
+  if(dqr->dqr_array == NULL)
+    return;
+
+  qsort(dqr->dqr_array, dqr->dqr_entries, sizeof(dvr_entry_t *), sf);
+}
+
+static void
+dvr_query_sort(dvr_query_result_t *dqr)
+{
+  dvr_query_sort_cmp(dqr, dvr_sort_start_descending);
+}
+
 /**
  * Root page, we direct the client to different pages depending
  * on if it is a full blown browser or just some mobile app
@@ -67,7 +164,6 @@ page_simple(http_connection_t *hc,
   dvr_entry_t *de;
   dvr_query_result_t dqr;
   const char *rstatus = NULL;
-  epg_query_result_t eqr;
   const char *lang  = http_arg_get(&hc->hc_args, "Accept-Language");
 
   htsbuf_qprintf(hq, "<html>");
@@ -87,13 +183,19 @@ page_simple(http_connection_t *hc,
 
 
   if(s != NULL) {
-    
-    epg_query(&eqr, NULL, NULL, NULL, s, lang);
-    epg_query_sort(&eqr);
+    epg_query_t eq;
 
-    c = eqr.eqr_entries;
+    memset(&eq, 0, sizeof(eq));
+    eq.lang = strdup(lang);
+    eq.fulltext = 1;
+    eq.stitle = s ? strdup(s) : NULL;
 
-    if(eqr.eqr_entries == 0) {
+    //Note: force min/max durations for this interface to 0 and INT_MAX seconds respectively
+    epg_query(&eq, hc->hc_access);
+
+    c = eq.entries;
+
+    if(eq.entries == 0) {
       htsbuf_qprintf(hq, "<b>No matching entries found</b>");
     } else {
 
@@ -108,7 +210,7 @@ page_simple(http_connection_t *hc,
 
       memset(&day, -1, sizeof(struct tm));
       for(k = 0; k < c; k++) {
-	e = eqr.eqr_array[k];
+	e = eq.result[k];
       
 	localtime_r(&e->start, &a);
 	localtime_r(&e->stop, &b);
@@ -136,7 +238,7 @@ page_simple(http_connection_t *hc,
       }
     }
     htsbuf_qprintf(hq, "<hr>");
-    epg_query_free(&eqr);
+    epg_query_free(&eq);
   }
 
 
@@ -170,7 +272,7 @@ page_simple(http_connection_t *hc,
     rstatus = val2str(de->de_sched_state, recstatustxt);
 
 
-    htsbuf_qprintf(hq, "<a href=\"/pvrinfo/%d\">", de->de_id);
+    htsbuf_qprintf(hq, "<a href=\"/pvrinfo/%s\">", idnode_uuid_as_str(&de->de_id));
     
     htsbuf_qprintf(hq, 
 		"%02d:%02d-%02d:%02d&nbsp; %s",
@@ -207,7 +309,7 @@ page_einfo(http_connection_t *hc, const char *remain, void *opaque)
 
   pthread_mutex_lock(&global_lock);
 
-  if(remain == NULL || (e = epg_broadcast_find_by_id(atoi(remain), NULL)) == NULL) {
+  if(remain == NULL || (e = epg_broadcast_find_by_id(strtoll(remain, NULL, 10))) == NULL) {
     pthread_mutex_unlock(&global_lock);
     return 404;
   }
@@ -215,8 +317,9 @@ page_einfo(http_connection_t *hc, const char *remain, void *opaque)
   de = dvr_entry_find_by_event(e);
 
   if((http_arg_get(&hc->hc_req_args, "rec")) != NULL) {
-    de = dvr_entry_create_by_event("", e, 0, 0, hc->hc_username ?: "anonymous", NULL,
-				   DVR_PRIO_NORMAL);
+    de = dvr_entry_create_by_event(NULL, e, 0, 0, hc->hc_username ?: NULL,
+                                   hc->hc_representative ?: NULL, NULL,
+				   DVR_PRIO_NORMAL, 0, "simpleui");
   } else if(de != NULL && (http_arg_get(&hc->hc_req_args, "cancel")) != NULL) {
     de = dvr_entry_cancel(de);
   }
@@ -234,7 +337,7 @@ page_einfo(http_connection_t *hc, const char *remain, void *opaque)
 
   s = epg_episode_get_title(e->episode, lang);
   htsbuf_qprintf(hq, "<hr><b>\"%s\": \"%s\"</b><br><br>",
-	      e->channel->ch_name, s ?: "");
+	      channel_get_name(e->channel), s ?: "");
   
   dvr_status = de != NULL ? de->de_sched_state : DVR_NOSTATE;
 
@@ -306,7 +409,7 @@ page_pvrinfo(http_connection_t *hc, const char *remain, void *opaque)
 
   if(de == NULL) {
     pthread_mutex_unlock(&global_lock);
-    http_redirect(hc, "/simple.html");
+    http_redirect(hc, "/simple.html", &hc->hc_req_args);
     return 0;
   }
 
@@ -322,13 +425,13 @@ page_pvrinfo(http_connection_t *hc, const char *remain, void *opaque)
 	      a.tm_hour, a.tm_min, b.tm_hour, b.tm_min);
 
   htsbuf_qprintf(hq, "<hr><b>\"%s\": \"%s\"</b><br><br>",
-	      de->de_channel->ch_name, lang_str_get(de->de_title, NULL));
+	      DVR_CH_NAME(de), lang_str_get(de->de_title, NULL));
   
   if((rstatus = val2str(de->de_sched_state, recstatustxt)) != NULL)
     htsbuf_qprintf(hq, "Recording status: %s<br>", rstatus);
 
-  htsbuf_qprintf(hq, "<form method=\"post\" action=\"/pvrinfo/%d\">", 
-	      de->de_id);
+  htsbuf_qprintf(hq, "<form method=\"post\" action=\"/pvrinfo/%s\">",
+	         idnode_uuid_as_str(&de->de_id));
 
   switch(de->de_sched_state) {
   case DVR_SCHEDULED:
@@ -411,7 +514,7 @@ page_status(http_connection_t *hc,
 
     if (DVR_SCHEDULED == de->de_sched_state)
     {
-      timelefttemp = (int) ((de->de_start - now) / 60) - de->de_start_extra; // output minutes
+      timelefttemp = (int) ((dvr_entry_get_start_time(de) - now) / 60); // output minutes
       if (timelefttemp < timeleft)
         timeleft = timelefttemp;
     }
@@ -422,40 +525,40 @@ page_status(http_connection_t *hc,
 
       html_escape(buf, lang_str_get(de->de_title, NULL), sizeof(buf));
       htsbuf_qprintf(hq, 
-		    "<recording>"
-		     "<start>"
-		     "<date>%d/%02d/%02d</date>"
-		     "<time>%02d:%02d</time>"
-		     "<unixtime>%"PRItime_t"</unixtime>"
-		     "<extra_start>%"PRItime_t"</extra_start>"
-		     "</start>"
-		     "<stop>"
-		     "<date>%d/%02d/%02d</date>"
-		     "<time>%02d:%02d</time>"
-		     "<unixtime>%"PRItime_t"</unixtime>"
-		     "<extra_stop>%"PRItime_t"</extra_stop>"
-		     "</stop>"
-		     "<title>%s</title>",
+		    "<recording>\n"
+		     "<start>\n"
+		     "<date>%d/%02d/%02d</date>\n"
+		     "<time>%02d:%02d</time>\n"
+		     "<unixtime>%"PRItime_t"</unixtime>\n"
+		     "<extra_start>%"PRItime_t"</extra_start>\n"
+		     "</start>\n"
+		     "<stop>\n"
+		     "<date>%d/%02d/%02d</date>\n"
+		     "<time>%02d:%02d</time>\n"
+		     "<unixtime>%"PRItime_t"</unixtime>\n"
+		     "<extra_stop>%"PRItime_t"</extra_stop>\n"
+		     "</stop>\n"
+		     "<title>%s</title>\n",
 		     a.tm_year + 1900, a.tm_mon + 1, a.tm_mday,
 		     a.tm_hour, a.tm_min, 
 		     de->de_start, 
-		     de->de_start_extra, 
+		     (time_t)dvr_entry_get_extra_time_pre(de),
 		     b.tm_year+1900, b.tm_mon + 1, b.tm_mday,
 		     b.tm_hour, b.tm_min, 
 		     de->de_stop, 
-		     de->de_stop_extra,
+		     (time_t)dvr_entry_get_extra_time_post(de),
          buf);
 
       rstatus = val2str(de->de_sched_state, recstatustxt);
       html_escape(buf, rstatus, sizeof(buf));
-      htsbuf_qprintf(hq, "<status>%s</status></recording>\n", buf);
+      htsbuf_qprintf(hq, "<status>%s</status>\n</recording>\n", buf);
       cc++;
       timeleft = -1;
     }
   }
 
   if ((cc==0) && (timeleft < INT_MAX)) {
-    htsbuf_qprintf(hq, "<recording><next>%d</next></recording>\n",timeleft);
+    htsbuf_qprintf(hq, "<recording>\n<next>%d</next>\n</recording>\n",timeleft);
   }
 
   dvr_query_free(&dqr);
@@ -466,6 +569,27 @@ page_status(http_connection_t *hc,
   pthread_mutex_unlock(&global_lock);
 
   htsbuf_qprintf(hq, "</currentload>");
+  http_output_content(hc, "text/xml");
+
+  return 0;
+}
+
+/**
+ * flush epgdb to disk on call
+ */
+static int
+page_epgsave(http_connection_t *hc,
+	    const char *remain, void *opaque)
+{
+  htsbuf_queue_t *hq = &hc->hc_reply;
+
+  htsbuf_qprintf(hq, "<?xml version=\"1.0\"?>\n"
+                 "<epgflush>1</epgflush>\n");
+
+  pthread_mutex_lock(&global_lock);
+  epg_save();
+  pthread_mutex_unlock(&global_lock);
+
   http_output_content(hc, "text/xml");
 
   return 0;
@@ -483,4 +607,5 @@ simpleui_start(void)
   http_path_add("/eventinfo",   NULL, page_einfo,   ACCESS_SIMPLE);
   http_path_add("/pvrinfo",     NULL, page_pvrinfo, ACCESS_SIMPLE);
   http_path_add("/status.xml",  NULL, page_status,  ACCESS_SIMPLE);
+  http_path_add("/epgsave",	NULL, page_epgsave,     ACCESS_SIMPLE);
 }

@@ -3,16 +3,34 @@ build.*
 
 src/version.c
 
+data/dvb-scan
+
+libav_static
+
 .cproject
 .project
+nbproject
 .settings
-data/dvb-scan
 
 *.pyc
 .*.sw[op]
+*.bak
 
+debian/changelog
 debian/files
 debian/tvheadend
 debian/tvheadend-dbg
 debian/tvheadend*substvars
 debian/tvheadend*.debhelper*
+
+rpm/tvheadend.spec
+rpm/test.patch
+
+#############
+###Windows###
+#############
+
+#windows image file cache
+Thumbs.db
+#Folder config file
+Desktop.ini

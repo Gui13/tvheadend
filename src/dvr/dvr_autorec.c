@@ -1,6 +1,6 @@
 /*
  *  tvheadend, Automatic recordings
- *  Copyright (C) 2010 Andreas Öman
+ *  Copyright (C) 2010 Andreas ï¿½man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -26,35 +26,30 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <math.h>
+#include <time.h>
 
 #include "tvheadend.h"
 #include "settings.h"
 #include "dvr.h"
-#include "notify.h"
-#include "dtable.h"
 #include "epg.h"
-
-dtable_t *autorec_dt;
-
-TAILQ_HEAD(dvr_autorec_entry_queue, dvr_autorec_entry);
+#include "htsp_server.h"
 
 static int dvr_autorec_in_init = 0;
 
 struct dvr_autorec_entry_queue autorec_entries;
 
-static void dvr_autorec_changed(dvr_autorec_entry_t *dae, int purge);
-
 /**
  * Unlink - and remove any unstarted
  */
 static void
-dvr_autorec_purge_spawns(dvr_autorec_entry_t *dae)
+dvr_autorec_purge_spawns(dvr_autorec_entry_t *dae, int del)
 {
   dvr_entry_t *de;
 
   while((de = LIST_FIRST(&dae->dae_spawns)) != NULL) {
     LIST_REMOVE(de, de_autorec_link);
     de->de_autorec = NULL;
+    if (!del) continue;
     if (de->de_sched_state == DVR_SCHEDULED)
       dvr_entry_cancel(de);
     else
@@ -70,6 +65,7 @@ autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
 {
   channel_tag_mapping_t *ctm;
   dvr_config_t *cfg;
+  double duration;
 
   if (!e->channel) return 0;
   if (!e->episode) return 0;
@@ -78,38 +74,62 @@ autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
 
   if(dae->dae_channel == NULL &&
      dae->dae_channel_tag == NULL &&
-     dae->dae_content_type.code == 0 &&
+     dae->dae_content_type == 0 &&
      (dae->dae_title == NULL ||
      dae->dae_title[0] == '\0') &&
      dae->dae_brand == NULL &&
      dae->dae_season == NULL &&
+     dae->dae_minduration <= 0 &&
+     (dae->dae_maxduration <= 0 || dae->dae_maxduration > 24 * 3600) &&
      dae->dae_serieslink == NULL)
     return 0; // Avoid super wildcard match
 
   // Note: we always test season first, though it will only be set
   //       if configured
-  if(dae->dae_serieslink)
+  if(dae->dae_serieslink) {
     if (!e->serieslink || dae->dae_serieslink != e->serieslink) return 0;
-  if(dae->dae_season)
-    if (!e->episode->season || dae->dae_season != e->episode->season) return 0;
-  if(dae->dae_brand)
-    if (!e->episode->brand || dae->dae_brand != e->episode->brand) return 0;
-  
+  } else {
+    if(dae->dae_season)
+      if (!e->episode->season || dae->dae_season != e->episode->season) return 0;
+    if(dae->dae_brand)
+      if (!e->episode->brand || dae->dae_brand != e->episode->brand) return 0;
+  }
   if(dae->dae_title != NULL && dae->dae_title[0] != '\0') {
     lang_str_ele_t *ls;
-    if(!e->episode->title) return 0;
-    RB_FOREACH(ls, e->episode->title, link)
-      if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+    if (!dae->dae_fulltext) {
+      if(!e->episode->title) return 0;
+      RB_FOREACH(ls, e->episode->title, link)
+        if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+    } else {
+      ls = NULL;
+      if (e->episode->title)
+        RB_FOREACH(ls, e->episode->title, link)
+          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+      if (!ls && e->episode->subtitle)
+        RB_FOREACH(ls, e->episode->subtitle, link)
+          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+      if (!ls && e->summary)
+        RB_FOREACH(ls, e->summary, link)
+          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+      if (!ls && e->description)
+        RB_FOREACH(ls, e->description, link)
+          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+    }
     if (!ls) return 0;
   }
 
   // Note: ignore channel test if we allow quality unlocking 
-  cfg = dvr_config_find_by_name_default(dae->dae_config_name);
+  if ((cfg = dae->dae_config) == NULL)
+    return 0;
   if (cfg->dvr_sl_quality_lock)
-    if(dae->dae_channel != NULL &&
-       dae->dae_channel != e->channel)
-      return 0;
-  
+    if(dae->dae_channel != NULL) {
+      if (dae->dae_channel != e->channel &&
+          dae->dae_channel->ch_enabled)
+        return 0;
+      if (!dae->dae_channel->ch_enabled)
+        return 0;
+    }
+
   if(dae->dae_channel_tag != NULL) {
     LIST_FOREACH(ctm, &dae->dae_channel_tag->ct_ctms, ctm_tag_link)
       if(ctm->ctm_channel == e->channel)
@@ -118,20 +138,47 @@ autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
       return 0;
   }
 
-  if(dae->dae_content_type.code != 0) {
-    if (!epg_genre_list_contains(&e->episode->genre, &dae->dae_content_type, 1))
+  if(dae->dae_content_type != 0) {
+    epg_genre_t ct;
+    memset(&ct, 0, sizeof(ct));
+    ct.code = dae->dae_content_type;
+    if (!epg_genre_list_contains(&e->episode->genre, &ct, 1))
       return 0;
   }
 
-  if(dae->dae_approx_time != 0) {
-    struct tm a_time;
-    struct tm ev_time;
+  if(dae->dae_start >= 0 && dae->dae_start_window >= 0 &&
+     dae->dae_start < 24*60 && dae->dae_start_window < 24*60) {
+    struct tm a_time, ev_time;
+    time_t ta, te, tad;
     localtime_r(&e->start, &a_time);
-    localtime_r(&e->start, &ev_time);
-    a_time.tm_min = dae->dae_approx_time % 60;
-    a_time.tm_hour = dae->dae_approx_time / 60;
-    if(abs(mktime(&a_time) - mktime(&ev_time)) > 900)
-      return 0;
+    ev_time = a_time;
+    a_time.tm_min = dae->dae_start % 60;
+    a_time.tm_hour = dae->dae_start / 60;
+    ta = mktime(&a_time);
+    te = mktime(&ev_time);
+    if(dae->dae_start > dae->dae_start_window) {
+      ta -= 24 * 3600; /* 24 hours */
+      tad = ((24 * 60) - dae->dae_start + dae->dae_start_window) * 60;
+      if(ta > te || te > ta + tad) {
+        ta += 24 * 3600;
+        if(ta > te || te > ta + tad)
+          return 0;
+      }
+    } else {
+      tad = (dae->dae_start_window - dae->dae_start) * 60;
+      if(ta > te || te > ta + tad)
+        return 0;
+    }
+  }
+
+  duration = difftime(e->stop,e->start);
+
+  if(dae->dae_minduration > 0) {
+    if(duration < dae->dae_minduration) return 0;
+  }
+
+  if(dae->dae_maxduration > 0) {
+    if(duration > dae->dae_maxduration) return 0;
   }
 
   if(dae->dae_weekdays != 0x7f) {
@@ -143,55 +190,149 @@ autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
   return 1;
 }
 
+/**
+ *
+ */
+dvr_autorec_entry_t *
+dvr_autorec_create(const char *uuid, htsmsg_t *conf)
+{
+  dvr_autorec_entry_t *dae;
+
+  dae = calloc(1, sizeof(*dae));
+
+  if (idnode_insert(&dae->dae_id, uuid, &dvr_autorec_entry_class, 0)) {
+    if (uuid)
+      tvhwarn("dvr", "invalid autorec entry uuid '%s'", uuid);
+    free(dae);
+    return NULL;
+  }
+
+  dae->dae_weekdays = 0x7f;
+  dae->dae_pri = DVR_PRIO_NORMAL;
+  dae->dae_start = -1;
+  dae->dae_start_window = -1;
+  dae->dae_config = dvr_config_find_by_name_default(NULL);
+  LIST_INSERT_HEAD(&dae->dae_config->dvr_autorec_entries, dae, dae_config_link);
+
+  TAILQ_INSERT_TAIL(&autorec_entries, dae, dae_link);
+
+  idnode_load(&dae->dae_id, conf);
+
+  htsp_autorec_entry_add(dae);
+
+  return dae;
+}
+
+
+dvr_autorec_entry_t*
+dvr_autorec_create_htsp(const char *dvr_config_name, const char *title, int fulltext,
+                            channel_t *ch, uint32_t enabled, int32_t start, int32_t start_window,
+                            uint32_t weekdays, time_t start_extra, time_t stop_extra,
+                            dvr_prio_t pri, int retention,
+                            int min_duration, int max_duration,
+                            const char *owner, const char *creator, const char *comment, 
+                            const char *name, const char *directory)
+{
+  dvr_autorec_entry_t *dae;
+  htsmsg_t *conf, *days;
+
+  conf = htsmsg_create_map();
+  days = htsmsg_create_list();
+
+  htsmsg_add_u32(conf, "enabled",     enabled > 0 ? 1 : 0);
+  htsmsg_add_u32(conf, "retention",   retention);
+  htsmsg_add_u32(conf, "pri",         pri);
+  htsmsg_add_u32(conf, "minduration", min_duration);
+  htsmsg_add_u32(conf, "maxduration", max_duration);
+  htsmsg_add_s64(conf, "start_extra", start_extra);
+  htsmsg_add_s64(conf, "stop_extra",  stop_extra);
+  htsmsg_add_str(conf, "title",       title);
+  htsmsg_add_u32(conf, "fulltext",    1);
+  htsmsg_add_str(conf, "config_name", dvr_config_name ?: "");
+  htsmsg_add_str(conf, "owner",       owner ?: "");
+  htsmsg_add_str(conf, "creator",     creator ?: "");
+  htsmsg_add_str(conf, "comment",     comment ?: "");
+  htsmsg_add_str(conf, "name",        name ?: "");
+  htsmsg_add_str(conf, "directory",   directory ?: "");
+
+  if (start >= 0)
+    htsmsg_add_s32(conf, "start", start);
+  if (start_window >= 0)
+    htsmsg_add_s32(conf, "start_window", start_window);
+  if (ch)
+    htsmsg_add_str(conf, "channel", idnode_uuid_as_str(&ch->ch_id));
+
+  int i;
+  for (i = 0; i < 7; i++)
+    if (weekdays & (1 << i))
+      htsmsg_add_u32(days, NULL, i + 1);
+
+  htsmsg_add_msg(conf, "weekdays", days);
+
+  dae = dvr_autorec_create(NULL, conf);
+  htsmsg_destroy(conf);
+
+  if (dae) {
+    dvr_autorec_save(dae);
+    dvr_autorec_changed(dae, 1);
+  }
+
+  return dae;
+}
 
 /**
  *
  */
 dvr_autorec_entry_t *
-autorec_entry_find(const char *id, int create)
+dvr_autorec_add_series_link(const char *dvr_config_name,
+                            epg_broadcast_t *event,
+                            const char *owner, const char *creator,
+                            const char *comment)
 {
   dvr_autorec_entry_t *dae;
-  char buf[20];
-  static int tally;
-
-  if(id != NULL) {
-    TAILQ_FOREACH(dae, &autorec_entries, dae_link)
-      if(!strcmp(dae->dae_id, id))
-	return dae;
-  }
-
-  if(create == 0)
+  htsmsg_t *conf;
+  char *title;
+  if (!event || !event->episode)
     return NULL;
-
-  dae = calloc(1, sizeof(dvr_autorec_entry_t));
-  if(id == NULL) {
-    tally++;
-    snprintf(buf, sizeof(buf), "%d", tally);
-    id = buf;
-  } else {
-    tally = MAX(atoi(id), tally);
-  }
-  dae->dae_weekdays = 0x7f;
-  dae->dae_pri = DVR_PRIO_NORMAL;
-
-  dae->dae_id = strdup(id);
-  TAILQ_INSERT_TAIL(&autorec_entries, dae, dae_link);
+  conf = htsmsg_create_map();
+  title = regexp_escape(epg_broadcast_get_title(event, NULL));
+  htsmsg_add_u32(conf, "enabled", 1);
+  htsmsg_add_str(conf, "title", title);
+  free(title);
+  htsmsg_add_str(conf, "config_name", dvr_config_name ?: "");
+  htsmsg_add_str(conf, "channel", channel_get_name(event->channel));
+  if (event->serieslink)
+    htsmsg_add_str(conf, "serieslink", event->serieslink->uri);
+  htsmsg_add_str(conf, "owner", owner ?: "");
+  htsmsg_add_str(conf, "creator", creator ?: "");
+  htsmsg_add_str(conf, "comment", comment ?: "");
+  dae = dvr_autorec_create(NULL, conf);
+  htsmsg_destroy(conf);
   return dae;
 }
-
-
 
 /**
  *
  */
 static void
-autorec_entry_destroy(dvr_autorec_entry_t *dae)
+autorec_entry_destroy(dvr_autorec_entry_t *dae, int delconf)
 {
-  dvr_autorec_purge_spawns(dae);
+  dvr_autorec_purge_spawns(dae, delconf);
 
-  free(dae->dae_id);
+  if (delconf)
+    hts_settings_remove("dvr/autorec/%s", idnode_uuid_as_str(&dae->dae_id));
 
-  free(dae->dae_config_name);
+  htsp_autorec_entry_delete(dae);
+
+  TAILQ_REMOVE(&autorec_entries, dae, dae_link);
+  idnode_unlink(&dae->dae_id);
+
+  if(dae->dae_config)
+    LIST_REMOVE(dae, dae_config_link);
+
+  free(dae->dae_name);
+  free(dae->dae_directory);
+  free(dae->dae_owner);
   free(dae->dae_creator);
   free(dae->dae_comment);
 
@@ -212,255 +353,735 @@ autorec_entry_destroy(dvr_autorec_entry_t *dae)
     dae->dae_season->putref(dae->dae_season);
   if(dae->dae_serieslink)
     dae->dae_serieslink->putref(dae->dae_serieslink);
-  
 
-  TAILQ_REMOVE(&autorec_entries, dae, dae_link);
   free(dae);
 }
 
 /**
  *
  */
+void
+dvr_autorec_save(dvr_autorec_entry_t *dae)
+{
+  htsmsg_t *m = htsmsg_create_map();
+
+  lock_assert(&global_lock);
+
+  idnode_save(&dae->dae_id, m);
+  hts_settings_save(m, "dvr/autorec/%s", idnode_uuid_as_str(&dae->dae_id));
+  htsmsg_destroy(m);
+}
+
+/* **************************************************************************
+ * DVR Autorec Entry Class definition
+ * **************************************************************************/
+
 static void
-build_weekday_tags(char *buf, size_t buflen, int mask)
+dvr_autorec_entry_class_save(idnode_t *self)
 {
-  int i, p = 0;
-  for(i = 0; i < 7; i++) {
-    if(mask & (1 << i) && p < buflen - 3) {
-      if(p != 0)
-	buf[p++] = ',';
-      buf[p++] = '1' + i;
-    }
-  }
-  buf[p] = 0;
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)self;
+  dvr_autorec_save(dae);
+  dvr_autorec_changed(dae, 1);
 }
 
-/**
- *
- */
+static void
+dvr_autorec_entry_class_delete(idnode_t *self)
+{
+  autorec_entry_destroy((dvr_autorec_entry_t *)self, 1);
+}
+
 static int
-build_weekday_mask(const char *str)
+dvr_autorec_entry_class_perm(idnode_t *self, access_t *a, htsmsg_t *msg_to_write)
 {
-  int r = 0;
-  for(; *str; str++) 
-    if(*str >= '1' && *str <= '7')
-      r |= 1 << (*str - '1');
-  return r;
-}
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)self;
 
-
-/**
- *
- */
-static htsmsg_t *
-autorec_record_build(dvr_autorec_entry_t *dae)
-{
-  char str[30];
-  htsmsg_t *e = htsmsg_create_map();
-
-  htsmsg_add_str(e, "id", dae->dae_id);
-  htsmsg_add_u32(e, "enabled",  !!dae->dae_enabled);
-
-  if (dae->dae_config_name != NULL)
-    htsmsg_add_str(e, "config_name", dae->dae_config_name);
-  if(dae->dae_creator != NULL)
-    htsmsg_add_str(e, "creator", dae->dae_creator);
-  if(dae->dae_comment != NULL)
-    htsmsg_add_str(e, "comment", dae->dae_comment);
-
-  if(dae->dae_channel != NULL)
-    htsmsg_add_str(e, "channel", dae->dae_channel->ch_name);
-
-  if(dae->dae_channel_tag != NULL)
-    htsmsg_add_str(e, "tag", dae->dae_channel_tag->ct_name);
-
-  htsmsg_add_u32(e, "contenttype",dae->dae_content_type.code);
-
-  htsmsg_add_str(e, "title", dae->dae_title ?: "");
-
-  htsmsg_add_u32(e, "approx_time", dae->dae_approx_time);
-
-  build_weekday_tags(str, sizeof(str), dae->dae_weekdays);
-  htsmsg_add_str(e, "weekdays", str);
-
-  htsmsg_add_str(e, "pri", dvr_val2pri(dae->dae_pri));
-  
-  if (dae->dae_brand)
-    htsmsg_add_str(e, "brand", dae->dae_brand->uri);
-  if (dae->dae_season)
-    htsmsg_add_str(e, "season", dae->dae_season->uri);
-  if (dae->dae_serieslink)
-    htsmsg_add_str(e, "serieslink", dae->dae_serieslink->uri);
-
-  return e;
-}
-
-/**
- *
- */
-static htsmsg_t *
-autorec_record_get_all(void *opaque)
-{
-  htsmsg_t *r = htsmsg_create_list();
-  dvr_autorec_entry_t *dae;
-
-  TAILQ_FOREACH(dae, &autorec_entries, dae_link)
-    htsmsg_add_msg(r, NULL, autorec_record_build(dae));
-
-  return r;
-}
-
-/**
- *
- */
-static htsmsg_t *
-autorec_record_get(void *opaque, const char *id)
-{
-  dvr_autorec_entry_t *ae;
-
-  if((ae = autorec_entry_find(id, 0)) == NULL)
-    return NULL;
-  return autorec_record_build(ae);
-}
-
-
-/**
- *
- */
-static htsmsg_t *
-autorec_record_create(void *opaque)
-{
-  return autorec_record_build(autorec_entry_find(NULL, 1));
-}
-
-
-/**
- *
- */
-static htsmsg_t *
-autorec_record_update(void *opaque, const char *id, htsmsg_t *values, 
-		      int maycreate)
-{
-  int save;
-  dvr_autorec_entry_t *dae;
-  const char *s;
-  channel_t *ch;
-  channel_tag_t *ct;
-  uint32_t u32;
-
-  if((dae = autorec_entry_find(id, maycreate)) == NULL)
-    return NULL;
-
-  tvh_str_update(&dae->dae_config_name, htsmsg_get_str(values, "config_name"));
-  tvh_str_update(&dae->dae_creator, htsmsg_get_str(values, "creator"));
-  tvh_str_update(&dae->dae_comment, htsmsg_get_str(values, "comment"));
-
-  if((s = htsmsg_get_str(values, "channel")) != NULL) {
-    if(dae->dae_channel != NULL) {
-      LIST_REMOVE(dae, dae_channel_link);
-      dae->dae_channel = NULL;
-    }
-    if((ch = channel_find_by_name(s, 0, 0)) != NULL) {
-      LIST_INSERT_HEAD(&ch->ch_autorecs, dae, dae_channel_link);
-      dae->dae_channel = ch;
-    }
-  }
-
-  if((s = htsmsg_get_str(values, "title")) != NULL) {
-    if(dae->dae_title != NULL) {
-      free(dae->dae_title);
-      dae->dae_title = NULL;
-      regfree(&dae->dae_title_preg);
-    }
-
-    if(!regcomp(&dae->dae_title_preg, s,
-		REG_ICASE | REG_EXTENDED | REG_NOSUB)) {
-      dae->dae_title = strdup(s);
-    }
-  }
-
-  if((s = htsmsg_get_str(values, "tag")) != NULL) {
-    if(dae->dae_channel_tag != NULL) {
-      LIST_REMOVE(dae, dae_channel_tag_link);
-      dae->dae_channel_tag = NULL;
-    }
-    if((ct = channel_tag_find_by_name(s, 0)) != NULL) {
-      LIST_INSERT_HEAD(&ct->ct_autorecs, dae, dae_channel_tag_link);
-      dae->dae_channel_tag = ct;
-    }
-  }
-
-  dae->dae_content_type.code = htsmsg_get_u32_or_default(values, "contenttype", 0);
-
-  if((s = htsmsg_get_str(values, "approx_time")) != NULL) {
-    if(strchr(s, ':') != NULL) {
-      // formatted time string - convert
-      dae->dae_approx_time = (atoi(s) * 60) + atoi(s + 3);
-    } else if(strlen(s) == 0) {
-      dae->dae_approx_time = 0;
-    } else {
-      dae->dae_approx_time = atoi(s);
-    }
-  }
-
-  if((s = htsmsg_get_str(values, "weekdays")) != NULL)
-    dae->dae_weekdays = build_weekday_mask(s);
-
-  if(!htsmsg_get_u32(values, "enabled", &u32))
-    dae->dae_enabled = u32;
-
-  if((s = htsmsg_get_str(values, "pri")) != NULL)
-    dae->dae_pri = dvr_pri2val(s);
-
-  if((s = htsmsg_get_str(values, "brand")) != NULL) {
-    dae->dae_brand = epg_brand_find_by_uri(s, 1, &save);
-    if (dae->dae_brand)
-      dae->dae_brand->getref((epg_object_t*)dae->dae_brand);
-  }
-  if((s = htsmsg_get_str(values, "season")) != NULL) {
-    dae->dae_season = epg_season_find_by_uri(s, 1, &save);
-    if (dae->dae_season)
-      dae->dae_season->getref((epg_object_t*)dae->dae_season);
-  }
-  if((s = htsmsg_get_str(values, "serieslink")) != NULL) {
-    dae->dae_serieslink = epg_serieslink_find_by_uri(s, 1, &save);
-    if (dae->dae_serieslink)
-      dae->dae_serieslink->getref(dae->dae_serieslink);
-  }
-  if (!dvr_autorec_in_init)
-    dvr_autorec_changed(dae, 1);
-
-  return autorec_record_build(dae);
-}
-
-
-/**
- *
- */
-static int
-autorec_record_delete(void *opaque, const char *id)
-{
-  dvr_autorec_entry_t *dae;
-
-  if((dae = autorec_entry_find(id, 0)) == NULL)
+  if (access_verify2(a, ACCESS_OR|ACCESS_ADMIN|ACCESS_RECORDER))
     return -1;
-  autorec_entry_destroy(dae);
+  if (!access_verify2(a, ACCESS_ADMIN))
+    return 0;
+  if (dvr_autorec_entry_verify(dae, a))
+    return -1;
   return 0;
 }
 
+static const char *
+dvr_autorec_entry_class_get_title (idnode_t *self)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)self;
+  const char *s = "";
+  if (dae->dae_name && dae->dae_name[0] != '\0')
+    s = dae->dae_name;
+  else if (dae->dae_comment && dae->dae_comment[0] != '\0')
+    s = dae->dae_comment;
+  return s;
+}
 
-/**
- *
- */
-static const dtable_class_t autorec_dtc = {
-  .dtc_record_get     = autorec_record_get,
-  .dtc_record_get_all = autorec_record_get_all,
-  .dtc_record_create  = autorec_record_create,
-  .dtc_record_update  = autorec_record_update,
-  .dtc_record_delete  = autorec_record_delete,
-  .dtc_read_access = ACCESS_RECORDER,
-  .dtc_write_access = ACCESS_RECORDER,
-  .dtc_mutex = &global_lock,
+static int
+dvr_autorec_entry_class_channel_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  channel_t *ch = v ? channel_find_by_uuid(v) : NULL;
+  if (ch == NULL) ch = v ? channel_find_by_name(v) : NULL;
+  if (ch == NULL) {
+    if (dae->dae_channel) {
+      LIST_REMOVE(dae, dae_channel_link);
+      dae->dae_channel = NULL;
+      return 1;
+    }
+  } else if (dae->dae_channel != ch) {
+    if (dae->dae_channel)
+      LIST_REMOVE(dae, dae_channel_link);
+    dae->dae_channel = ch;
+    LIST_INSERT_HEAD(&ch->ch_autorecs, dae, dae_channel_link);
+    return 1;
+  }
+  return 0;
+}
+
+static const void *
+dvr_autorec_entry_class_channel_get(void *o)
+{
+  static const char *ret;
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  if (dae->dae_channel)
+    ret = idnode_uuid_as_str(&dae->dae_channel->ch_id);
+  else
+    ret = "";
+  return &ret;
+}
+
+static char *
+dvr_autorec_entry_class_channel_rend(void *o)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  if (dae->dae_channel)
+    return strdup(channel_get_name(dae->dae_channel));
+  return NULL;
+}
+
+static int
+dvr_autorec_entry_class_title_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  const char *title = v ?: "";
+  if (strcmp(title, dae->dae_title ?: "")) {
+    if (dae->dae_title) {
+       regfree(&dae->dae_title_preg);
+       free(dae->dae_title);
+       dae->dae_title = NULL;
+    }
+    if (title[0] != '\0' &&
+        !regcomp(&dae->dae_title_preg, title,
+                 REG_ICASE | REG_EXTENDED | REG_NOSUB))
+      dae->dae_title = strdup(title);
+    return 1;
+  }
+  return 0;
+}
+
+static int
+dvr_autorec_entry_class_tag_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  channel_tag_t *tag = v ? channel_tag_find_by_uuid(v) : NULL;
+  if (tag == NULL) tag = v ? channel_tag_find_by_name(v, 0) : NULL;
+  if (tag == NULL && dae->dae_channel_tag) {
+    LIST_REMOVE(dae, dae_channel_tag_link);
+    dae->dae_channel_tag = NULL;
+    return 1;
+  } else if (dae->dae_channel_tag != tag) {
+    if (dae->dae_channel_tag)
+      LIST_REMOVE(dae, dae_channel_tag_link);
+    dae->dae_channel_tag = tag;
+    LIST_INSERT_HEAD(&tag->ct_autorecs, dae, dae_channel_tag_link);
+    return 1;
+  }
+  return 0;
+}
+
+static const void *
+dvr_autorec_entry_class_tag_get(void *o)
+{
+  static const char *ret;
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  if (dae->dae_channel_tag)
+    ret = idnode_uuid_as_str(&dae->dae_channel_tag->ct_id);
+  else
+    ret = "";
+  return &ret;
+}
+
+static char *
+dvr_autorec_entry_class_tag_rend(void *o)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  if (dae->dae_channel_tag)
+    return strdup(dae->dae_channel_tag->ct_name);
+  return NULL;
+}
+
+static int
+dvr_autorec_entry_class_time_set(void *o, const void *v, int *tm)
+{
+  const char *s = v;
+  int t;
+
+  if(s == NULL || s[0] == '\0' || !isdigit(s[0]))
+    t = -1;
+  else if(strchr(s, ':') != NULL)
+    // formatted time string - convert
+    t = (atoi(s) * 60) + atoi(s + 3);
+  else {
+    t = atoi(s);
+  }
+  if (t >= 24 * 60)
+    t = -1;
+  if (t != *tm) {
+    *tm = t;
+    return 1;
+  }
+  return 0;
+}
+
+static int
+dvr_autorec_entry_class_start_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  return dvr_autorec_entry_class_time_set(o, v, &dae->dae_start);
+}
+
+static int
+dvr_autorec_entry_class_start_window_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  return dvr_autorec_entry_class_time_set(o, v, &dae->dae_start_window);
+}
+
+static const void *
+dvr_autorec_entry_class_time_get(void *o, int tm)
+{
+  static const char *ret;
+  static char buf[16];
+  if (tm >= 0)
+    snprintf(buf, sizeof(buf), "%02d:%02d", tm / 60, tm % 60);
+  else
+    strcpy(buf, "Any");
+  ret = buf;
+  return &ret;
+}
+
+static const void *
+dvr_autorec_entry_class_start_get(void *o)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  return dvr_autorec_entry_class_time_get(o, dae->dae_start);
+}
+
+static const void *
+dvr_autorec_entry_class_start_window_get(void *o)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  return dvr_autorec_entry_class_time_get(o, dae->dae_start_window);
+}
+
+htsmsg_t *
+dvr_autorec_entry_class_time_list(void *o, const char *null)
+{
+  int i;
+  htsmsg_t *l = htsmsg_create_list();
+  char buf[16];
+  htsmsg_add_str(l, NULL, null);
+  for (i = 0; i < 24*60;  i += 10) {
+    snprintf(buf, sizeof(buf), "%02d:%02d", i / 60, (i % 60));
+    htsmsg_add_str(l, NULL, buf);
+  }
+  return l;
+}
+
+static htsmsg_t *
+dvr_autorec_entry_class_time_list_(void *o)
+{
+  return dvr_autorec_entry_class_time_list(o, "Any");
+}
+
+static htsmsg_t *
+dvr_autorec_entry_class_extra_list(void *o)
+{
+  return dvr_entry_class_duration_list(o, "Not set (use channel or DVR config)", 4*60, 1);
+}
+
+static htsmsg_t *
+dvr_autorec_entry_class_minduration_list(void *o)
+{
+  return dvr_entry_class_duration_list(o, "Any", 24*60, 60);
+}
+
+static htsmsg_t *
+dvr_autorec_entry_class_maxduration_list(void *o)
+{
+  return dvr_entry_class_duration_list(o, "Any", 24*60, 60);
+}
+
+static int
+dvr_autorec_entry_class_config_name_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  dvr_config_t *cfg = v ? dvr_config_find_by_uuid(v) : NULL;
+  if (cfg == NULL) cfg = v ? dvr_config_find_by_name_default(v): NULL;
+  if (cfg == NULL && dae->dae_config) {
+    dae->dae_config = NULL;
+    LIST_REMOVE(dae, dae_config_link);
+    return 1;
+  } else if (cfg != dae->dae_config) {
+    if (dae->dae_config)
+      LIST_REMOVE(dae, dae_config_link);
+    LIST_INSERT_HEAD(&cfg->dvr_autorec_entries, dae, dae_config_link);
+    dae->dae_config = cfg;
+    return 1;
+  }
+  return 0;
+}
+
+static const void *
+dvr_autorec_entry_class_config_name_get(void *o)
+{
+  static const char *ret;
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  if (dae->dae_config)
+    ret = idnode_uuid_as_str(&dae->dae_config->dvr_id);
+  else
+    ret = "";
+  return &ret;
+}
+
+static char *
+dvr_autorec_entry_class_config_name_rend(void *o)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  if (dae->dae_config)
+    return strdup(dae->dae_config->dvr_config_name);
+  return NULL;
+}
+
+static int
+dvr_autorec_entry_class_weekdays_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  htsmsg_field_t *f;
+  uint32_t u32, bits = 0;
+
+  HTSMSG_FOREACH(f, (htsmsg_t *)v)
+    if (!htsmsg_field_get_u32(f, &u32) && u32 > 0 && u32 < 8)
+      bits |= (1 << (u32 - 1));
+
+  if (bits != dae->dae_weekdays) {
+    dae->dae_weekdays = bits;
+    return 1;
+  }
+  return 0;
+}
+
+htsmsg_t *
+dvr_autorec_entry_class_weekdays_get(uint32_t weekdays)
+{
+  htsmsg_t *m = htsmsg_create_list();
+  int i;
+  for (i = 0; i < 7; i++)
+    if (weekdays & (1 << i))
+      htsmsg_add_u32(m, NULL, i + 1);
+  return m;
+}
+
+static htsmsg_t *
+dvr_autorec_entry_class_weekdays_default(void)
+{
+  return dvr_autorec_entry_class_weekdays_get(0x7f);
+}
+
+static const void *
+dvr_autorec_entry_class_weekdays_get_(void *o)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  return dvr_autorec_entry_class_weekdays_get(dae->dae_weekdays);
+}
+
+static const struct strtab dvr_autorec_entry_class_weekdays_tab[] = {
+  { "Mon", 1 },
+  { "Tue", 2 },
+  { "Wed", 3 },
+  { "Thu", 4 },
+  { "Fri", 5 },
+  { "Sat", 6 },
+  { "Sun", 7 },
+};
+
+htsmsg_t *
+dvr_autorec_entry_class_weekdays_list ( void *o )
+{
+  return strtab2htsmsg(dvr_autorec_entry_class_weekdays_tab);
+}
+
+char *
+dvr_autorec_entry_class_weekdays_rend(uint32_t weekdays)
+{
+  char buf[32];
+  size_t l;
+  int i;
+  if (weekdays == 0x7f)
+    strcpy(buf + 1, "All days");
+  else if (weekdays == 0)
+    strcpy(buf + 1, "No days");
+  else {
+    buf[0] = '\0';
+    for (i = 0; i < 7; i++)
+      if (weekdays & (1 << i)) {
+        l = strlen(buf);
+        snprintf(buf + l, sizeof(buf) - l, ",%s",
+                 val2str(i + 1, dvr_autorec_entry_class_weekdays_tab));
+      }
+  }
+  return strdup(buf + 1);
+}
+
+static char *
+dvr_autorec_entry_class_weekdays_rend_(void *o)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  return dvr_autorec_entry_class_weekdays_rend(dae->dae_weekdays);
+}
+
+static int
+dvr_autorec_entry_class_brand_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  int save;
+  epg_brand_t *brand;
+
+  if (v && *(char *)v == '\0')
+    v = NULL;
+  brand = v ? epg_brand_find_by_uri(v, 1, &save) : NULL;
+  if (brand && dae->dae_brand != brand) {
+    if (dae->dae_brand)
+      dae->dae_brand->putref((epg_object_t*)dae->dae_brand);
+    brand->getref((epg_object_t*)brand);
+    dae->dae_brand = brand;
+    return 1;
+  } else if (brand == NULL && dae->dae_brand) {
+    dae->dae_brand->putref((epg_object_t*)dae->dae_brand);
+    dae->dae_brand = NULL;
+    return 1;
+  }
+  return 0;
+}
+
+static const void *
+dvr_autorec_entry_class_brand_get(void *o)
+{
+  static const char *ret;
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  if (dae->dae_brand)
+    ret = dae->dae_brand->uri;
+  else
+    ret = "";
+  return &ret;
+}
+
+static int
+dvr_autorec_entry_class_season_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  int save;
+  epg_season_t *season;
+
+  if (v && *(char *)v == '\0')
+    v = NULL;
+  season = v ? epg_season_find_by_uri(v, 1, &save) : NULL;
+  if (season && dae->dae_season != season) {
+    if (dae->dae_season)
+      dae->dae_season->putref((epg_object_t*)dae->dae_season);
+    season->getref((epg_object_t*)season);
+    dae->dae_season = season;
+    return 1;
+  } else if (season == NULL && dae->dae_season) {
+    dae->dae_season->putref((epg_object_t*)dae->dae_season);
+    dae->dae_season = NULL;
+    return 1;
+  }
+  return 0;
+}
+
+static const void *
+dvr_autorec_entry_class_season_get(void *o)
+{
+  static const char *ret;
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  if (dae->dae_season)
+    ret = dae->dae_season->uri;
+  else
+    ret = "";
+  return &ret;
+}
+
+static int
+dvr_autorec_entry_class_series_link_set(void *o, const void *v)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  int save;
+  epg_serieslink_t *sl;
+
+  if (v && *(char *)v == '\0')
+    v = NULL;
+  sl = v ? epg_serieslink_find_by_uri(v, 1, &save) : NULL;
+  if (sl && dae->dae_serieslink != sl) {
+    if (dae->dae_serieslink)
+      dae->dae_serieslink->putref((epg_object_t*)dae->dae_season);
+    sl->getref((epg_object_t*)sl);
+    dae->dae_serieslink = sl;
+    return 1;
+  } else if (sl == NULL && dae->dae_serieslink) {
+    dae->dae_season->putref((epg_object_t*)dae->dae_season);
+    dae->dae_season = NULL;
+    return 1;
+  }
+  return 0;
+}
+
+static const void *
+dvr_autorec_entry_class_series_link_get(void *o)
+{
+  static const char *ret;
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
+  if (dae->dae_serieslink)
+    ret = dae->dae_serieslink->uri;
+  else
+    ret = "";
+  return &ret;
+}
+
+static htsmsg_t *
+dvr_autorec_entry_class_content_type_list(void *o)
+{
+  htsmsg_t *m = htsmsg_create_map();
+  htsmsg_add_str(m, "type",  "api");
+  htsmsg_add_str(m, "uri",   "epg/content_type/list");
+  return m;
+}
+
+static htsmsg_t *
+dvr_autorec_entry_class_dedup_list ( void *o )
+{
+  static const struct strtab tab[] = {
+    { "Record all",            DVR_AUTOREC_RECORD_ALL },
+    { "Record if different episode number", DVR_AUTOREC_RECORD_DIFFERENT_EPISODE_NUMBER },
+    { "Record if different subtitle", DVR_AUTOREC_RECORD_DIFFERENT_SUBTITLE },
+    { "Record if different description", DVR_AUTOREC_RECORD_DIFFERENT_DESCRIPTION },
+    { "Record once per week", DVR_AUTOREC_RECORD_ONCE_PER_WEEK },
+    { "Record once per day", DVR_AUTOREC_RECORD_ONCE_PER_DAY },
+  };
+  return strtab2htsmsg(tab);
+}
+
+const idclass_t dvr_autorec_entry_class = {
+  .ic_class      = "dvrautorec",
+  .ic_caption    = "DVR Auto-Record Entry",
+  .ic_event      = "dvrautorec",
+  .ic_save       = dvr_autorec_entry_class_save,
+  .ic_get_title  = dvr_autorec_entry_class_get_title,
+  .ic_delete     = dvr_autorec_entry_class_delete,
+  .ic_perm       = dvr_autorec_entry_class_perm,
+  .ic_properties = (const property_t[]) {
+    {
+      .type     = PT_BOOL,
+      .id       = "enabled",
+      .name     = "Enabled",
+      .off      = offsetof(dvr_autorec_entry_t, dae_enabled),
+    },
+    {
+      .type     = PT_STR,
+      .id       = "name",
+      .name     = "Name",
+      .off      = offsetof(dvr_autorec_entry_t, dae_name),
+    },
+	{
+      .type     = PT_STR,
+      .id       = "directory",
+      .name     = "Directory",
+      .off      = offsetof(dvr_autorec_entry_t, dae_directory),
+    },
+    {
+      .type     = PT_STR,
+      .id       = "title",
+      .name     = "Title (Regexp)",
+      .set      = dvr_autorec_entry_class_title_set,
+      .off      = offsetof(dvr_autorec_entry_t, dae_title),
+    },
+    {
+      .type     = PT_BOOL,
+      .id       = "fulltext",
+      .name     = "Fulltext",
+      .off      = offsetof(dvr_autorec_entry_t, dae_fulltext),
+    },
+    {
+      .type     = PT_STR,
+      .id       = "channel",
+      .name     = "Channel",
+      .set      = dvr_autorec_entry_class_channel_set,
+      .get      = dvr_autorec_entry_class_channel_get,
+      .rend     = dvr_autorec_entry_class_channel_rend,
+      .list     = channel_class_get_list,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "tag",
+      .name     = "Channel Tag",
+      .set      = dvr_autorec_entry_class_tag_set,
+      .get      = dvr_autorec_entry_class_tag_get,
+      .rend     = dvr_autorec_entry_class_tag_rend,
+      .list     = channel_tag_class_get_list,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "start",
+      .name     = "Start After",
+      .set      = dvr_autorec_entry_class_start_set,
+      .get      = dvr_autorec_entry_class_start_get,
+      .list     = dvr_autorec_entry_class_time_list_,
+      .opts     = PO_SORTKEY
+    },
+    {
+      .type     = PT_STR,
+      .id       = "start_window",
+      .name     = "Start Before",
+      .set      = dvr_autorec_entry_class_start_window_set,
+      .get      = dvr_autorec_entry_class_start_window_get,
+      .list     = dvr_autorec_entry_class_time_list_,
+      .opts     = PO_SORTKEY,
+    },
+    {
+      .type     = PT_TIME,
+      .id       = "start_extra",
+      .name     = "Extra Start Time",
+      .off      = offsetof(dvr_autorec_entry_t, dae_start_extra),
+      .list     = dvr_autorec_entry_class_extra_list,
+      .opts     = PO_DURATION | PO_SORTKEY
+    },
+    {
+      .type     = PT_TIME,
+      .id       = "stop_extra",
+      .name     = "Extra Stop Time",
+      .off      = offsetof(dvr_autorec_entry_t, dae_stop_extra),
+      .list     = dvr_autorec_entry_class_extra_list,
+      .opts     = PO_DURATION | PO_SORTKEY
+    },
+    {
+      .type     = PT_U32,
+      .islist   = 1,
+      .id       = "weekdays",
+      .name     = "Week Days",
+      .set      = dvr_autorec_entry_class_weekdays_set,
+      .get      = dvr_autorec_entry_class_weekdays_get_,
+      .list     = dvr_autorec_entry_class_weekdays_list,
+      .rend     = dvr_autorec_entry_class_weekdays_rend_,
+      .def.list = dvr_autorec_entry_class_weekdays_default
+    },
+    {
+      .type     = PT_INT,
+      .id       = "minduration",
+      .name     = "Minimal Duration",
+      .list     = dvr_autorec_entry_class_minduration_list,
+      .off      = offsetof(dvr_autorec_entry_t, dae_minduration),
+    },
+    {
+      .type     = PT_INT,
+      .id       = "maxduration",
+      .name     = "Maximal Duration",
+      .list     = dvr_autorec_entry_class_maxduration_list,
+      .off      = offsetof(dvr_autorec_entry_t, dae_maxduration),
+    },
+    {
+      .type     = PT_U32,
+      .id       = "content_type",
+      .name     = "Content Type",
+      .list     = dvr_autorec_entry_class_content_type_list,
+      .off      = offsetof(dvr_autorec_entry_t, dae_content_type),
+    },
+    {
+      .type     = PT_U32,
+      .id       = "pri",
+      .name     = "Priority",
+      .list     = dvr_entry_class_pri_list,
+      .def.i    = DVR_PRIO_NORMAL,
+      .off      = offsetof(dvr_autorec_entry_t, dae_pri),
+    },
+    {
+      .type     = PT_U32,
+      .id       = "record",
+      .name     = "Duplicate Handling",
+      .def.i    = DVR_AUTOREC_RECORD_ALL,
+      .off      = offsetof(dvr_autorec_entry_t, dae_record),
+      .list     = dvr_autorec_entry_class_dedup_list,
+    },
+    {
+      .type     = PT_INT,
+      .id       = "retention",
+      .name     = "Retention",
+      .off      = offsetof(dvr_autorec_entry_t, dae_retention),
+    },
+    {
+      .type     = PT_STR,
+      .id       = "config_name",
+      .name     = "DVR Configuration",
+      .set      = dvr_autorec_entry_class_config_name_set,
+      .get      = dvr_autorec_entry_class_config_name_get,
+      .rend     = dvr_autorec_entry_class_config_name_rend,
+      .list     = dvr_entry_class_config_name_list,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "brand",
+      .name     = "Brand",
+      .set      = dvr_autorec_entry_class_brand_set,
+      .get      = dvr_autorec_entry_class_brand_get,
+      .opts     = PO_RDONLY,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "season",
+      .name     = "Season",
+      .set      = dvr_autorec_entry_class_season_set,
+      .get      = dvr_autorec_entry_class_season_get,
+      .opts     = PO_RDONLY,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "serieslink",
+      .name     = "Series Link",
+      .set      = dvr_autorec_entry_class_series_link_set,
+      .get      = dvr_autorec_entry_class_series_link_get,
+      .opts     = PO_RDONLY,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "owner",
+      .name     = "Owner",
+      .off      = offsetof(dvr_autorec_entry_t, dae_owner),
+      .opts     = PO_RDONLY,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "creator",
+      .name     = "Creator",
+      .off      = offsetof(dvr_autorec_entry_t, dae_creator),
+      .opts     = PO_RDONLY,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "comment",
+      .name     = "Comment",
+      .off      = offsetof(dvr_autorec_entry_t, dae_comment),
+    },
+    {}
+  }
 };
 
 /**
@@ -469,11 +1090,31 @@ static const dtable_class_t autorec_dtc = {
 void
 dvr_autorec_init(void)
 {
+  htsmsg_t *l, *c;
+  htsmsg_field_t *f;
+
   TAILQ_INIT(&autorec_entries);
-  autorec_dt = dtable_create(&autorec_dtc, "autorec", NULL);
   dvr_autorec_in_init = 1;
-  dtable_load(autorec_dt);
+  if((l = hts_settings_load("dvr/autorec")) != NULL) {
+    HTSMSG_FOREACH(f, l) {
+      if((c = htsmsg_get_map_by_field(f)) == NULL)
+        continue;
+      (void)dvr_autorec_create(f->hmf_name, c);
+    }
+    htsmsg_destroy(l);
+  }
   dvr_autorec_in_init = 0;
+}
+
+void
+dvr_autorec_done(void)
+{
+  dvr_autorec_entry_t *dae;
+
+  pthread_mutex_lock(&global_lock);
+  while ((dae = TAILQ_FIRST(&autorec_entries)) != NULL)
+    autorec_entry_destroy(dae, 0);
+  pthread_mutex_unlock(&global_lock);
 }
 
 void
@@ -484,93 +1125,6 @@ dvr_autorec_update(void)
     dvr_autorec_changed(dae, 0);
   }
 }
-
-static void
-_dvr_autorec_add(const char *config_name,
-                const char *title, channel_t *ch,
-		const char *tag, epg_genre_t *content_type,
-    epg_brand_t *brand, epg_season_t *season,
-    epg_serieslink_t *serieslink,
-    int approx_time, epg_episode_num_t *epnum,
-		const char *creator, const char *comment)
-{
-  dvr_autorec_entry_t *dae;
-  htsmsg_t *m;
-  channel_tag_t *ct;
-
-  if((dae = autorec_entry_find(NULL, 1)) == NULL)
-    return;
-
-  tvh_str_set(&dae->dae_config_name, config_name);
-  tvh_str_set(&dae->dae_creator, creator);
-  tvh_str_set(&dae->dae_comment, comment);
-
-  if(ch) {
-    LIST_INSERT_HEAD(&ch->ch_autorecs, dae, dae_channel_link);
-    dae->dae_channel = ch;
-  }
-
-  if(title != NULL &&
-     !regcomp(&dae->dae_title_preg, title,
-	      REG_ICASE | REG_EXTENDED | REG_NOSUB)) {
-    dae->dae_title = strdup(title);
-  }
-
-  if(tag != NULL && (ct = channel_tag_find_by_name(tag, 0)) != NULL) {
-    LIST_INSERT_HEAD(&ct->ct_autorecs, dae, dae_channel_tag_link);
-    dae->dae_channel_tag = ct;
-  }
-
-  dae->dae_enabled = 1;
-  if (content_type)
-    dae->dae_content_type.code = content_type->code;
-
-  if(serieslink) {
-    serieslink->getref(serieslink);
-    dae->dae_serieslink = serieslink;
-  }
-
-  dae->dae_approx_time = approx_time;
-
-  m = autorec_record_build(dae);
-  hts_settings_save(m, "%s/%s", "autorec", dae->dae_id);
-  htsmsg_destroy(m);
-
-  /* Notify web clients that we have messed with the tables */
-
-  notify_reload("autorec");
-
-  dvr_autorec_changed(dae, 1);
-}
-
-void
-dvr_autorec_add(const char *config_name,
-                const char *title, const char *channel,
-		const char *tag, epg_genre_t *content_type,
-		const char *creator, const char *comment)
-{
-  channel_t *ch = NULL;
-  if(channel != NULL) ch = channel_find_by_name(channel, 0, 0);
-  _dvr_autorec_add(config_name, title, ch, tag, content_type,
-                   NULL, NULL, NULL, 0, NULL, creator, comment);
-}
-
-void dvr_autorec_add_series_link 
-  ( const char *dvr_config_name, epg_broadcast_t *event,
-    const char *creator, const char *comment )
-{
-  if (!event || !event->episode) return;
-  _dvr_autorec_add(dvr_config_name,
-                   epg_broadcast_get_title(event, NULL),
-                   event->channel,
-                   NULL, 0, // tag/content type
-                   NULL,
-                   NULL,
-                   event->serieslink,
-                   0, NULL,
-                   creator, comment);
-}
-
 
 /**
  *
@@ -608,21 +1162,24 @@ void dvr_autorec_check_serieslink(epg_serieslink_t *s)
 /**
  *
  */
-static void
+void
 dvr_autorec_changed(dvr_autorec_entry_t *dae, int purge)
 {
   channel_t *ch;
   epg_broadcast_t *e;
 
   if (purge)
-    dvr_autorec_purge_spawns(dae);
+    dvr_autorec_purge_spawns(dae, 1);
 
-  RB_FOREACH(ch, &channel_name_tree, ch_name_link) {
+  CHANNEL_FOREACH(ch) {
+    if (!ch->ch_enabled) continue;
     RB_FOREACH(e, &ch->ch_epg_schedule, sched_link) {
       if(autorec_cmp(dae, e))
-	      dvr_entry_create_by_autorec(e, dae);
+        dvr_entry_create_by_autorec(e, dae);
     }
   }
+
+  htsp_autorec_entry_update(dae);
 }
 
 
@@ -630,18 +1187,61 @@ dvr_autorec_changed(dvr_autorec_entry_t *dae, int purge)
  *
  */
 void
-autorec_destroy_by_channel(channel_t *ch)
+autorec_destroy_by_channel(channel_t *ch, int delconf)
 {
   dvr_autorec_entry_t *dae;
-  htsmsg_t *m;
 
-  while((dae = LIST_FIRST(&ch->ch_autorecs)) != NULL) {
-    dtable_record_erase(autorec_dt, dae->dae_id);
-    autorec_entry_destroy(dae);
+  while((dae = LIST_FIRST(&ch->ch_autorecs)) != NULL)
+    autorec_entry_destroy(dae, delconf);
+}
+
+/*
+ *
+ */
+void
+autorec_destroy_by_channel_tag(channel_tag_t *ct, int delconf)
+{
+  dvr_autorec_entry_t *dae;
+
+  while((dae = LIST_FIRST(&ct->ct_autorecs)) != NULL) {
+    LIST_REMOVE(dae, dae_channel_tag_link);
+    dae->dae_channel_tag = NULL;
+    idnode_notify_simple(&dae->dae_id);
+    if (delconf)
+      dvr_autorec_save(dae);
   }
+}
 
-  /* Notify web clients that we have messed with the tables */
-  m = htsmsg_create_map();
-  htsmsg_add_u32(m, "reload", 1);
-  notify_by_msg("autorec", m);
+/*
+ *
+ */
+void
+autorec_destroy_by_id(const char *id, int delconf)
+{
+  dvr_autorec_entry_t *dae;
+  dae = dvr_autorec_find_by_uuid(id);
+
+  if (dae)
+    autorec_entry_destroy(dae, delconf);
+}
+
+/**
+ *
+ */
+void
+autorec_destroy_by_config(dvr_config_t *kcfg, int delconf)
+{
+  dvr_autorec_entry_t *dae;
+  dvr_config_t *cfg = NULL;
+
+  while((dae = LIST_FIRST(&kcfg->dvr_autorec_entries)) != NULL) {
+    LIST_REMOVE(dae, dae_config_link);
+    if (cfg == NULL && delconf)
+      cfg = dvr_config_find_by_name_default(NULL);
+    if (cfg)
+      LIST_INSERT_HEAD(&cfg->dvr_autorec_entries, dae, dae_config_link);
+    dae->dae_config = cfg;
+    if (delconf)
+      dvr_autorec_save(dae);
+  }
 }

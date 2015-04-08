@@ -9,12 +9,13 @@
 # Defaults
 # ###########################################################################
 
+CONFIGURE_ARGS="$*"
+
 # System setup
-[ -z "$PLATFORM" ] && PLATFORM=linux
+[ -z "$PLATFORM" ] && PLATFORM=$(uname -s | tr "[:upper:]" "[:lower:]")
 [ -z "$CPU"      ] && CPU=generic
-[ -z "$ARCH"     ] && ARCH=`uname -m`
+[ -z "$ARCH"     ] && ARCH=$(uname -m)
 [ -z "$OSENV"    ] && OSENV=posix
-[ -z "$CC"       ] && CC=cc
 [ -z "$PYTHON"   ] && PYTHON=python
 
 # Paths
@@ -30,7 +31,7 @@
 [ -z "$LDFLAGS"  ] && LDFLAGS=
 
 # Environment
-[ -z "$ROOTDIR"  ] && ROOTDIR=$(cd $(dirname $0); pwd)
+[ -z "$ROOTDIR"  ] && ROOTDIR=$(cd "$(dirname "$0")"; pwd)
 [ -z "$BUILDDIR" ] && BUILDDIR=$ROOTDIR/build.$PLATFORM
 [ -z "$TMPDIR"   ] && TMPDIR=/tmp
 
@@ -43,17 +44,18 @@
 # ###########################################################################
 
 # Output
-TAB=" \\033[40G"
+TAB="  %-50s"
 
 # Text conversion
-function toupper
+toupper ()
 {
   echo "$@" | tr abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ
 }
 
-function die
+# Terminate
+die ()
 {
-  [ -z "$1" ] || echo "ERROR: $1"
+  echo >&2 "ERROR: $@"
   exit 1
 }
 
@@ -62,12 +64,12 @@ function die
 # ###########################################################################
 
 # Enable/Disable option
-function _enable
+_enable ()
 {
   local opt=$1 val=$2 ignore=$3 row= k= v=
   for row in ${OPTIONS[*]}; do
     k=${row%:*}
-    [ "$k" == "$opt" ] || continue
+    [ "$k" = "$opt" ] || continue
     v=${row#*:}
     if [ $v != "$val" ]; then
       OPTIONS=(${OPTIONS[@]//$row/$k:$val})
@@ -78,34 +80,34 @@ function _enable
 }
 
 # Enable option
-function enable
+enable ()
 {
   _enable $1 yes $2
 }
 
 # Disable option
-function disable
+disable ()
 {
   _enable $1 no $2
 }
 
 # Enable package
-function enable_pkg
+enable_pkg ()
 {
   local opt=$1 row= k= v=
   for row in ${PACKAGES[*]}; do
-    [ "$row" == "$opt" ] && return
+    [ "$row" = "$opt" ] && return
   done
   PACKAGES=(${PACKAGES[@]} $opt)
 }
 
 # Get enabled state
-function _enabled
+_enabled ()
 {
   local opt=$1 row= k=
   for row in ${OPTIONS[*]}; do
     k=${row%:*}
-    [ "$k" == "$opt" ] || continue
+    [ "$k" = "$opt" ] || continue
     echo ${row#*:}
     return
   done
@@ -113,31 +115,31 @@ function _enabled
 }
 
 # Check if enabled
-function enabled
+enabled ()
 {
   local val=$(_enabled $1)
-  [ "$val" == "yes" ] && return 0 || return 1
+  [ "$val" = "yes" ] && return 0 || return 1
 }
 
 # Check if disabled
-function disabled
+disabled ()
 {
   local val=$(_enabled $1)
-  [ "$val" == "no" ] && return 0 || return 1
+  [ "$val" = "no" ] && return 0 || return 1
 }
 
 # Check if enabled (or auto)
-function enabled_or_auto
+enabled_or_auto ()
 {
   local val=$(_enabled $1)
-  [ "$val" == "yes" -o "$val" == "auto" ] && return 0 || return 1
+  [ "$val" = "yes" -o "$val" = "auto" ] && return 0 || return 1
 }
 
 # Check if disabled (or auto)
-function disabled_or_auto
+disabled_or_auto ()
 {
   local val=$(_enabled $1)
-  [ "$val" == "no" -o "$val" == "auto" ] && return 0 || return 1
+  [ "$val" = "no" -o "$val" = "auto" ] && return 0 || return 1
 }
 
 # ###########################################################################
@@ -145,97 +147,72 @@ function disabled_or_auto
 # ###########################################################################
 
 # Show help
-function show_help
+show_help ()
 { 
-  local opt= val=
+  local opt= val= fmt="%-30s"
   echo "Usage: $0 [options]"
   echo ""
   echo "Miscellaneous"
-  echo -e "  --help${TAB}Print this message"
+  printf "  $fmt Print this message\n" "--help"
   echo ""
   echo "Installation Paths"
-  echo -e "  --prefix=DIR${TAB}Installation root [$prefix]"
-  echo -e "  --bindir=DIR${TAB}Install binaries in DIR [$bindir]"
-  echo -e "  --libdir=DIR${TAB}Install libraries in DIR [$libdir]"
-  echo -e "  --mandir=DIR${TAB}Install man pages in DIR [$mandir]"
-  echo -e "  --datadir=DIR${TAB}Install data files in DIR [$datadir]"
+  printf "  $fmt Installation root [$prefix]\n" "--prefix=DIR$"
+  printf "  $fmt Install binaries in DIR [$bindir]\n" "--bindir=DIR"
+  printf "  $fmt Install libraries in DIR [$libdir]\n" "--libdir=DIR"
+  printf "  $fmt Install man pages in DIR [$mandir]\n" "--mandir=DIR"
+  printf "  $fmt Install data files in DIR [$datadir]\n" "--datadir=DIR"
   echo ""
   echo "Compiler/Arch"
-  echo -e "  --cc=CC${TAB}Build using compile [$CC]"
-  echo -e "  --cpu=CPU${TAB}Build and optimize for specific CPU"
-  echo -e "  --arch=ARCH${TAB}Build for architecture [$ARCH]"
-  echo -e "  --platform=PLATFORM${TAB}Build for platform [$PLATFORM]"
-  echo -e "  --python=PYTHON${TAB}Use python binary [$PYTHON]"
+  printf "  $fmt Build using compiler [$CC]\n" "--cc=CC"
+  printf "  $fmt Build using C flags\n" "--cflags=CFLAGS"
+  printf "  $fmt Build using LD flags\n" "--ldflags=LDFLAGS"
+  printf "  $fmt Build and optimize for specific CPU\n" "--cpu=CPU"
+  printf "  $fmt Build for architecture [$ARCH]\n" "--arch=ARCH"
+  printf "  $fmt Build for platform [$PLATFORM]\n" "--platform=PLATFORM"
+  printf "  $fmt Use python binary [$PYTHON]\n" "--python=PYTHON"
   echo ""
   echo "Options"
   for opt in ${OPTIONS[*]}; do
     val=${opt#*:}
     opt=${opt%:*}
-    if [ "$val" == "yes" ]; then
-      echo -e "  --disable-${opt}${TAB}Enable $opt [$val]"
-    elif [ "$val" == "no" ]; then
-      echo -e "  --enable-${opt}${TAB}Enable $opt [$val]"
+    if [ "$val" = "yes" ]; then
+      printf "  $fmt Disable ${opt}\n" "--disable-${opt}"
+    elif [ "$val" = "no" ]; then
+      printf "  $fmt Enable ${opt}\n" "--enable-${opt}"
     else
-      echo -e "  --(en|dis)able-${opt}${TAB}Enable $opt [$val]"
+      printf "  $fmt Disable ${opt}\n" "--disable-${opt}"
+      printf "  $fmt Enable ${opt}\n" "--enable-${opt}"
     fi
   done
   exit 0
 }
-
-# Process command line
-function parse_args
-{
-  local opt= val=
-  for opt do
-    val=${opt#*=}
-    opt=${opt%=*}
-    opt=${opt#*--}
-    case "$opt" in
-      help)
-        show_help
-        ;;
-      *dir|prefix)
-        eval "$opt=$val"
-        ;;
-      cc|arch|cpu|platform|python)
-        eval "`toupper $opt`=$val"
-        ;;
-      enable-*)
-        opt=${opt#*-}
-        enable $opt 1
-        ;;
-      disable-*)
-        opt=${opt#*-}
-        disable $opt 1
-        ;;
-    esac
-  done
-}
-
 
 # ###########################################################################
 # Package tests
 # ###########################################################################
 
 # Check package
-function check_pkg
+check_pkg ()
 {
   local pkg=$1; shift
   local ver=$*
 
   # Version test
-  ver=$(echo $ver | sed 's/>=/ --atleast-version /'\
+  cver=$(echo $ver | sed 's/>=/ --atleast-version /'\
                   | sed 's/<=/ --max-version /'\
                   | sed 's/==/ --exact-version /')
 
-  echo -ne "checking for pkg $pkg $ver ...${TAB}"
+  printf "$TAB" "checking for pkg $pkg $ver ..."
+
+  dver=$(pkg-config --modversion $pkg 2> /dev/null)
+  test -z "$dver" && dver="<none>"
 
   # Check for package
-  if pkg-config $pkg $ver; then
-    echo "ok"
+  if pkg-config $pkg $cver; then
+    echo "ok (detected ${dver})"
     enable_pkg $pkg
   else
-    echo "fail"
+    echo "fail (detected ${dver})"
     return 1
   fi
 }
@@ -245,30 +222,34 @@ function check_pkg
 # ###########################################################################
 
 # Check compiler
-function check_cc
+check_cc ()
 {
   local hdr=$1
   local opt=$2
   cat >$TMPDIR/$$.c <<EOF
 $hdr
 int main() {
- return 0;
+#ifdef TEST
+  return TEST();
+#else
+  return 0;
+#endif
 }
 EOF
-  $CC $CFLAGS $LDFLAGS $TMPDIR/$$.c -o $TMPDIR/$$.bin $opt &> /dev/null
+  $CC $CFLAGS $LDFLAGS $TMPDIR/$$.c -o $TMPDIR/$$.bin $opt > /dev/null 2>&1
   RET=$?
   rm -f $TMPDIR/$$.{c,bin}
   return $RET
 }
 
 # Check compiler header
-function check_cc_header
+check_cc_header ()
 {
   local hdr=$1
   local nam=$2
   [ -z "$nam" ] && nam=$hdr
 
-  echo -ne "checking for cc $hdr.h ...${TAB}"
+  printf "$TAB" "checking for cc $hdr.h ..."
 
   # Enable if supported
   if check_cc "#include <$1.h>"; then
@@ -281,13 +262,13 @@ function check_cc_header
 }
 
 # Check some compiler snippet
-function check_cc_snippet
+check_cc_snippet ()
 {
   local nam=$1
   local snp=$2
   local opt=$3
 
-  echo -ne "checking for cc $nam ...${TAB}"
+  printf "$TAB" "checking for cc $nam ..."
 
   # Check if supported
   if check_cc "$snp" "$opt"; then
@@ -300,13 +281,13 @@ function check_cc_snippet
 }
 
 # Check compiler option
-function check_cc_option
+check_cc_option ()
 {
   local opt=$1
   local nam=$2
   [ -z "$nam" ] && nam=$opt
   
-  echo -ne "checking for cc -m$opt ...${TAB}"
+  printf "$TAB" "checking for cc -m$opt ..."
 
   # Enable if supported
   if check_cc "" -m${opt}; then
@@ -319,13 +300,13 @@ function check_cc_option
 }
 
 # Check compiler library
-function check_cc_lib
+check_cc_lib ()
 {
   local opt=$1
   local nam=$2
   [ -z "$nam" ] && nam=$opt
   
-  echo -ne "checking for cc -l$opt ...${TAB}"
+  printf "$TAB" "checking for cc -l$opt ..."
 
   # Enable if supported
   if check_cc "" -l${opt}; then
@@ -342,26 +323,26 @@ function check_cc_lib
 # ###########################################################################
 
 # Check python
-function check_py
+check_py ()
 {
   local hdr=$1
   cat >$TMPDIR/$$.py <<EOF
 $hdr
 EOF
-  $PYTHON $TMPDIR/$$.py &> /dev/null
+  $PYTHON $TMPDIR/$$.py > /dev/null 2>&1
   RET=$?
   rm -f $TMPDIR/$$.py
   return $RET
 }
 
 # Check python import
-function check_py_import
+check_py_import ()
 {
   local hdr=$1
   local nam=$2
   [ -z "$nam" ] && nam=py_${hdr}
 
-  echo -ne "checking for py module $hdr ...${TAB}"
+  printf "$TAB" "checking for py module $hdr ..."
 
   # Enable if supported
   if check_py "import $hdr"; then
@@ -377,12 +358,12 @@ function check_py_import
 # Binary checks
 # ###########################################################################
 
-function check_bin
+check_bin ()
 {
   local bin=$1
   local nam=$2
   [ -z "$nam" ] && nam=bin_${bin}
-  echo -ne "checking for $bin ...${TAB}"
+  printf "$TAB" "checking for $bin ..."
 
   if which $bin &> /dev/null; then
     echo "ok"
@@ -398,19 +379,25 @@ function check_bin
 # ###########################################################################
 
 # Print config
-function print_config
+print_config ()
 {
-  local pkg=
+  local pkg= fmt="  %-40s %s\n"
 
   # Compiler settings
   echo ""
   echo "Compiler:"
-  echo -e "  Using C compiler:${TAB}${CC}"
-  echo -e "  Build for arch:${TAB}${ARCH}"
+  printf "$fmt" "Using C compiler:" "${CC}"
+  if [ "${CFLAGS}" != "" ]; then
+     printf "$fmt" "Using C flags:" "${CFLAGS}"
+  fi
+  if [ "${LDFLAGS}" != "" ]; then
+     printf "$fmt" "Using LD flags:" "${LDFLAGS}"
+  fi
+  printf "$fmt" "Build for arch:" "${ARCH}"
   echo ""
 
   echo "Binaries:"
-  echo -e "  Using PYTHON:${TAB}${PYTHON}"
+  printf "$fmt" "Using PYTHON:" "${PYTHON}"
   echo ""
 
   # Options
@@ -418,10 +405,10 @@ function print_config
   for opt in ${OPTIONS[*]}; do
     k=${opt%:*}
     v=${opt#*:}
-    if [ "$v" == "yes" ]; then
-      echo -e "  $k:${TAB}yes"
+    if [ "$v" = "yes" ]; then
+      printf "$fmt" "$k" "yes"
     else
-      echo -e "  $k:${TAB}no"
+      printf "$fmt" "$k" "no"
     fi
   done
   echo ""
@@ -429,37 +416,41 @@ function print_config
   # Packages
   echo "Packages:"
   for pkg in ${PACKAGES[*]}; do
-    echo -e "  ${pkg}:${TAB}$(pkg-config --modversion $pkg)"
+    printf "$fmt" "${pkg}" "$(pkg-config --modversion $pkg)"
   done
   echo ""
   
   # Installation
   echo "Installation paths:"
-  echo -e "  Prefix:${TAB}${prefix}"
-  echo -e "  Binaries:${TAB}${bindir}"
-  echo -e "  Libraries:${TAB}${libdir}"
-  echo -e "  Data files:${TAB}${datadir}"
-  echo -e "  Man pages:${TAB}${mandir}"
+  printf "$fmt" "Prefix:" "${prefix}"
+  printf "$fmt" "Binaries:" "${bindir}"
+  printf "$fmt" "Libraries:" "${libdir}"
+  printf "$fmt" "Data files:" "${datadir}"
+  printf "$fmt" "Man pages:" "${mandir}"
   echo ""
 }
 
 # Write configuration
-function write_config
+write_config ()
 {
   local pkg= opt= k= v=
 
   # Create build directory
-	mkdir -p ${BUILDDIR}
-	BUILDDIR=`cd ${BUILDDIR} && pwd`
+  mkdir -p "${BUILDDIR}"
+  BUILDDIR=$(cd "${BUILDDIR}" && pwd)
 
   # Create make include
-	CONFIG_MK=${ROOTDIR}/.config.mk
-  cat > ${CONFIG_MK} <<EOF
+  CONFIG_MK=${ROOTDIR}/.config.mk
+  cat > "${CONFIG_MK}" <<EOF
 # Automatically generated by configure - DO NOT EDIT!
+CONFIGURE_ARGS = ${CONFIGURE_ARGS}
 ROOTDIR  ?= ${ROOTDIR}
-BUILDDIR ?= ${ROOTDIR}/build.${PLATFORM}
+BUILDDIR ?= ${BUILDDIR}
+PLATFORM ?= ${PLATFORM}
 OSENV    ?= ${OSENV}
 ARCH     ?= ${ARCH}
+CPU      ?= ${CPU}
+COMPILER ?= ${COMPILER}
 ifeq (\$(origin CC),default)
 CC        = ${CC}
 endif
@@ -474,14 +465,19 @@ libdir    = ${libdir}
 EOF
 
   # Create C include
-  CONFIG_H=${BUILDDIR}/config.h
-  cat > ${CONFIG_H} <<EOF
+  CONFIG_H="${BUILDDIR}/build.h"
+  cat > "${CONFIG_H}" <<EOF
 // Automatically generated by configure - DO NOT EDIT!
+EOF
+
+  # Create Platform defines
+  cat > ${CONFIG_H} <<EOF
+#define PLATFORM_$(toupper ${PLATFORM}) 1
 EOF
 
   # Add package config
   for pkg in ${PACKAGES[*]}; do
-    cat >>${CONFIG_MK} <<EOF
+    cat >>"${CONFIG_MK}" <<EOF
 LDFLAGS += $(pkg-config --libs $pkg)
 CFLAGS  += $(pkg-config --cflags $pkg)
 EOF
@@ -491,19 +487,19 @@ EOF
   for row in ${OPTIONS[*]}; do
     k=$(toupper ${row%:*})
     v=${row#*:}
-    if [ "$v" == "yes" ]; then
-      cat >>${CONFIG_H} <<EOF
+    if [ "$v" = "yes" ]; then
+      cat >>"${CONFIG_H}" <<EOF
 #define ENABLE_${k} 1
 #define CONFIG_${k} 1
 EOF
-      cat >>${CONFIG_MK} <<EOF
+      cat >>"${CONFIG_MK}" <<EOF
 CONFIG_${k} = yes
 EOF
     else
-      cat >>${CONFIG_H} <<EOF
+      cat >>"${CONFIG_H}" <<EOF
 #define ENABLE_${k} 0
 EOF
-      cat >>${CONFIG_MK} <<EOF
+      cat >>"${CONFIG_MK}" <<EOF
 CONFIG_${k} = no
 EOF
     fi

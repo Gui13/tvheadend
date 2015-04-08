@@ -15,12 +15,12 @@
  *  You should have received a copy of the GNU General Public License
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-#include "config.h"
+#include "build.h"
 #include "trap.h"
 
 char tvh_binshasum[20];
 
-#if defined(__i386__) || defined(__x86_64__)
+#if (defined(__i386__) || defined(__x86_64__)) && !defined(PLATFORM_DARWIN)
 
 // Only do this on x86 for now
 
@@ -33,6 +33,7 @@ char tvh_binshasum[20];
 #include <limits.h>
 #if ENABLE_EXECINFO
 #include <execinfo.h>
+#include <dlfcn.h>
 #endif
 #include <stdio.h>
 #include <stdarg.h>
@@ -51,6 +52,10 @@ static char line1[200];
 static char tmpbuf[1024];
 static char libs[1024];
 static char self[PATH_MAX];
+
+#ifdef PLATFORM_FREEBSD
+extern char **environ;
+#endif
 
 static void
 sappend(char *buf, size_t l, const char *fmt, ...)
@@ -134,14 +139,18 @@ add2lineresolve(const char *binary, void *addr, char *buf0, size_t buflen)
 static void 
 traphandler(int sig, siginfo_t *si, void *UC)
 {
+#ifdef NGREG
   ucontext_t *uc = UC;
+#endif
 #if ENABLE_EXECINFO
   char buf[200];
   static void *frames[MAXFRAMES];
   int nframes = backtrace(frames, MAXFRAMES);
   Dl_info dli;
 #endif
+#if defined(NGREG) || defined(ENABLE_EXECINFO)
   int i;
+#endif
   const char *reason = NULL;
 
   tvhlog_spawn(LOG_ALERT, "CRASH", "Signal: %d in %s ", sig, line1);
@@ -165,15 +174,13 @@ traphandler(int sig, siginfo_t *si, void *UC)
 	       si->si_addr, reason ?: "N/A");
 
   tvhlog_spawn(LOG_ALERT, "CRASH", "Loaded libraries: %s ", libs);
-  snprintf(tmpbuf, sizeof(tmpbuf), "Register dump [%d]: ", NGREG);
+#ifdef NGREG
+  snprintf(tmpbuf, sizeof(tmpbuf), "Register dump [%d]: ", (int)NGREG);
 
   for(i = 0; i < NGREG; i++) {
-#if __WORDSIZE == 64
-    sappend(tmpbuf, sizeof(tmpbuf), "%016llx ", uc->uc_mcontext.gregs[i]);
-#else
-    sappend(tmpbuf, sizeof(tmpbuf), "%08x ", uc->uc_mcontext.gregs[i]);
-#endif
+    sappend(tmpbuf, sizeof(tmpbuf), "%016" PRIx64, uc->uc_mcontext.gregs[i]);
   }
+#endif
   tvhlog_spawn(LOG_ALERT, "CRASH", "%s", tmpbuf);
 
 #if ENABLE_EXECINFO
@@ -238,7 +245,8 @@ trap_init(const char *ver)
     self[0] = 0;
   else
     self[r] = 0;
-  
+
+  memset(digest, 0, sizeof(digest));  
   if((fd = open("/proc/self/exe", O_RDONLY)) != -1) {
     struct stat st;
     if(!fstat(fd, &st)) {
@@ -252,6 +260,7 @@ trap_init(const char *ver)
 	free(m);
       }
     }
+    close(fd);
   }
   
   snprintf(line1, sizeof(line1),
@@ -303,6 +312,26 @@ trap_init(const char *ver)
   sigaction(SIGILL,  &sa, &old);
   sigaction(SIGABRT, &sa, &old);
   sigaction(SIGFPE,  &sa, &old);
+
+  sigprocmask(SIG_UNBLOCK, &m, NULL);
+}
+
+#elif defined(PLATFORM_DARWIN)
+
+#include <string.h>
+#include <signal.h>
+
+void
+trap_init(const char *ver)
+{
+  sigset_t m;
+
+  sigemptyset(&m);
+  sigaddset(&m, SIGSEGV);
+  sigaddset(&m, SIGBUS);
+  sigaddset(&m, SIGILL);
+  sigaddset(&m, SIGABRT);
+  sigaddset(&m, SIGFPE);
 
   sigprocmask(SIG_UNBLOCK, &m, NULL);
 }

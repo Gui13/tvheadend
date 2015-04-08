@@ -11,6 +11,11 @@
  * Complete missing LIST-ops
  */
 
+#ifndef LIST_ENTRY_INIT
+#define LIST_ENTRY_INIT(elm, field) \
+        (elm)->field.le_next = NULL, (elm)->field.le_prev = NULL
+#endif
+
 #ifndef LIST_FOREACH
 #define	LIST_FOREACH(var, head, field)					\
 	for ((var) = ((head)->lh_first);				\
@@ -28,6 +33,14 @@
 
 #ifndef LIST_NEXT
 #define	LIST_NEXT(elm, field)		((elm)->field.le_next)
+#endif
+
+#ifndef LIST_SAFE_REMOVE
+#define LIST_SAFE_REMOVE(elm, field) \
+        if ((elm)->field.le_next != NULL || (elm)->field.le_prev != NULL) { \
+                LIST_REMOVE(elm, field); \
+                LIST_ENTRY_INIT(elm, field); \
+        }
 #endif
 
 #ifndef LIST_INSERT_BEFORE
@@ -86,12 +99,14 @@
  * Some extra functions for LIST manipulation
  */
 
+#ifndef LIST_MOVE
 #define LIST_MOVE(newhead, oldhead, field) do {			        \
         if((oldhead)->lh_first) {					\
            (oldhead)->lh_first->field.le_prev = &(newhead)->lh_first;	\
 	}								\
         (newhead)->lh_first = (oldhead)->lh_first;			\
-} while (0) 
+} while (0)
+#endif
 
 #define LIST_INSERT_SORTED(head, elm, field, cmpfunc) do {	\
         if(LIST_EMPTY(head)) {					\
@@ -129,12 +144,33 @@
         }							\
 } while(0)
 
+#define TAILQ_INSERT_SORTED_R(head, headname, elm, field, cmpfunc) do { \
+        if(TAILQ_FIRST(head) == NULL) {				\
+           TAILQ_INSERT_HEAD(head, elm, field);			\
+        } else {						\
+           typeof(elm) _tmp;					\
+           TAILQ_FOREACH_REVERSE(_tmp,head,headname,field) {			\
+              if(cmpfunc(elm,_tmp) >= 0) {			\
+                TAILQ_INSERT_AFTER(head,_tmp,elm,field);		\
+                break;						\
+              }							\
+              if(!TAILQ_PREV(_tmp,headname,field)) {			\
+                 TAILQ_INSERT_BEFORE(_tmp,elm,field);	\
+                 break;						\
+              }							\
+           }							\
+        }							\
+} while(0)
+
 #define TAILQ_MOVE(newhead, oldhead, field) do { \
         if(TAILQ_FIRST(oldhead)) { \
            TAILQ_FIRST(oldhead)->field.tqe_prev = &(newhead)->tqh_first;  \
-        } \
-        (newhead)->tqh_first = (oldhead)->tqh_first;                   \
-        (newhead)->tqh_last = (oldhead)->tqh_last;                     \
+          (newhead)->tqh_first = (oldhead)->tqh_first;                   \
+          (newhead)->tqh_last = (oldhead)->tqh_last;                     \
+          TAILQ_INIT(oldhead);\
+        } else { \
+          TAILQ_INIT(newhead);\
+        }\
 } while (/*CONSTCOND*/0) 
  
 

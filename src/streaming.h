@@ -27,6 +27,7 @@ typedef struct streaming_start_component {
   int ssc_index;
   int ssc_type;
   char ssc_lang[4];
+  uint8_t ssc_audio_type;
   uint16_t ssc_composition_id;
   uint16_t ssc_ancillary_id;
   uint16_t ssc_pid;
@@ -35,6 +36,7 @@ typedef struct streaming_start_component {
   int16_t ssc_aspect_num;
   int16_t ssc_aspect_den;
   uint8_t ssc_sri;
+  uint8_t ssc_ext_sri;
   uint8_t ssc_channels;
   uint8_t ssc_disabled;
   
@@ -55,6 +57,7 @@ typedef struct streaming_start {
 
   uint16_t ss_pcr_pid;
   uint16_t ss_pmt_pid;
+  uint16_t ss_service_id;
 
   streaming_start_component_t ss_components[0];
 
@@ -70,9 +73,7 @@ void streaming_target_init(streaming_target_t *st,
 			   st_callback_t *cb, void *opaque,
 			   int reject_filter);
 
-void streaming_queue_init(streaming_queue_t *sq, int reject_filter);
-
-void streaming_queue_init2
+void streaming_queue_init
   (streaming_queue_t *sq, int reject_filter, size_t maxsize);
 
 void streaming_queue_clear(struct streaming_message_queue *q);
@@ -101,7 +102,9 @@ streaming_message_t *streaming_msg_create_code(streaming_message_type_t type,
 
 streaming_message_t *streaming_msg_create_pkt(th_pkt_t *pkt);
 
-#define streaming_target_deliver(st, sm) ((st)->st_cb((st)->st_opaque, (sm)))
+static inline void
+streaming_target_deliver(streaming_target_t *st, streaming_message_t *sm)
+  { st->st_cb(st->st_opaque, sm); }
 
 void streaming_target_deliver2(streaming_target_t *st, streaming_message_t *sm);
 
@@ -109,8 +112,11 @@ void streaming_start_unref(streaming_start_t *ss);
 
 streaming_start_t *streaming_start_copy(const streaming_start_t *src);
 
-int streaming_pad_probe_type(streaming_pad_t *sp, 
-			     streaming_message_type_t smt);
+static inline int
+streaming_pad_probe_type(streaming_pad_t *sp, streaming_message_type_t smt)
+{
+  return (sp->sp_reject_filter & SMT_TO_MASK(smt)) == 0;
+}
 
 const char *streaming_code2txt(int code);
 

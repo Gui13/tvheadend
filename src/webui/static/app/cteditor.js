@@ -1,51 +1,73 @@
-tvheadend.cteditor = function() {
-	var fm = Ext.form;
+/*
+ * Channel Tag
+ */
 
-	var enabledColumn = new Ext.grid.CheckColumn({
-		header : "Enabled",
-		dataIndex : 'enabled',
-		width : 60
-	});
+tvheadend.cteditor = function(panel, index)
+{
+    tvheadend.idnode_grid(panel, {
+        url: 'api/channeltag',
+        all: 1,
+        titleS: 'Channel Tag',
+        titleP: 'Channel Tags',
+        iconCls: 'channelTags',
+        tabIndex: index,
+        add: {
+            url: 'api/channeltag',
+            create: { }
+        },
+        del: true,
+        sort: {
+          field: 'name',
+          direction: 'ASC'
+        },
+        help: function() {
+            new tvheadend.help('Channel Tags', 'config_tags.html');
+        }
+    });
 
-	var internalColumn = new Ext.grid.CheckColumn({
-		header : "Internal",
-		dataIndex : 'internal',
-		width : 100
-	});
+    return panel;
+};
 
-	var titledIconColumn = new Ext.grid.CheckColumn({
-		header : "Icon has title",
-		dataIndex : 'titledIcon',
-		width : 100,
-		tooltip : 'Set this if the supplied icon has a title embedded. '
-			+ 'This will tell displaying application not to superimpose title '
-			+ 'on top of logo.'
-	});
+/*
+ * Bouquet
+ */
+tvheadend.bouquet = function(panel, index)
+{
+    var list = 'enabled,rescan,name,maptoch,mapnolcn,lcn_off,mapnoname,mapradio,' +
+               'chtag,source,services_count,services_seen,comment';
 
-	var cm = new Ext.grid.ColumnModel({
-  defaultSortable: true,
-  columns : [ enabledColumn, {
-		header : "Name",
-		dataIndex : 'name',
-		editor : new fm.TextField({
-			allowBlank : false
-		})
-	}, internalColumn, {
-		header : "Icon (full URL)",
-		dataIndex : 'icon',
-		width : 400,
-		editor : new fm.TextField({})
-	}, titledIconColumn, {
-		header : "Comment",
-		dataIndex : 'comment',
-		width : 400,
-		editor : new fm.TextField({})
-	} ]});
+    tvheadend.idnode_grid(panel, {
+        url: 'api/bouquet',
+        titleS: 'Bouquet',
+        titleP: 'Bouquets',
+        iconCls: 'bouquets',
+        tabIndex: index,
+        columns: {
+            enabled:        { width: 50 },
+            rescan:         { width: 50 },
+            name:           { width: 200 },
+            maptoch:        { width: 100 },
+            mapnolcn:       { width: 100 },
+            mapradio:       { width: 100 },
+            lcn_off:        { width: 100 },
+            mapnoname:      { width: 100 },
+            chtag:          { width: 100 },
+            source:         { width: 200 },
+            services_count: { width: 100 },
+            services_seen:  { width: 100 },
+            comment:        { width: 200 }
+        },
+        list: list,
+        del: true,
+        edit: { params: { list: list } },
+        sort: {
+          field: 'name',
+          direction: 'ASC'
+        },
+        help: function() {
+            new tvheadend.help('Bouquets', 'config_bouquet.html');
+        },
+    });
 
-	var ChannelTagRecord = Ext.data.Record.create([ 'enabled', 'name',
-		'internal', 'icon', 'comment', 'titledIcon' ]);
-
-	return new tvheadend.tableEditor('Channel Tags', 'channeltags', cm,
-		ChannelTagRecord, [ enabledColumn, internalColumn, titledIconColumn ],
-		null, 'config_tags.html', 'tags');
-}
+    return panel;
+};

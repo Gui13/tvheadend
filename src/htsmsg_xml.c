@@ -829,9 +829,13 @@ htsmsg_xml_deserialize(char *src, char *errbuf, size_t errbufsize)
   char *src0 = src;
   int i;
 
-  xp.xp_errmsg[0] = 0;
+  memset(&xp, 0, sizeof(xp));
   xp.xp_encoding = XML_ENCODING_UTF8;
   LIST_INIT(&xp.xp_namespaces);
+
+  /* check for UTF-8 BOM */
+  if(src[0] == 0xef && src[1] == 0xbb && src[2] == 0xbf)
+    memmove(src, src + 3, strlen(src) - 2);
 
   if((src = htsmsg_parse_prolog(&xp, src)) == NULL)
     goto err;

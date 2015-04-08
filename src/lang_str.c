@@ -22,6 +22,9 @@
 #include "redblack.h"
 #include "lang_codes.h"
 #include "lang_str.h"
+#include "tvheadend.h"
+
+SKEL_DECLARE(lang_str_ele_skel, lang_str_ele_t);
 
 /* ************************************************************************
  * Support
@@ -47,6 +50,8 @@ lang_str_t *lang_str_create ( void )
 void lang_str_destroy ( lang_str_t *ls )
 { 
   lang_str_ele_t *e;
+  if (ls == NULL)
+    return;
   while ((e = RB_FIRST(ls))) {
     if (e->str)  free(e->str);
     RB_REMOVE(ls, e, link);
@@ -107,7 +112,6 @@ static int _lang_str_add
   ( lang_str_t *ls, const char *str, const char *lang, int update, int append )
 {
   int save = 0;
-  static lang_str_ele_t *skel = NULL;
   lang_str_ele_t *e;
 
   if (!str) return 0;
@@ -116,14 +120,14 @@ static int _lang_str_add
   if (!(lang = lang_code_get(lang))) return 0;
 
   /* Create skel */
-  if (!skel) skel = calloc(1, sizeof(lang_str_ele_t));
-  skel->lang = lang;
+  SKEL_ALLOC(lang_str_ele_skel);
+  lang_str_ele_skel->lang = lang;
 
   /* Create */
-  e = RB_INSERT_SORTED(ls, skel, link, _lang_cmp);
+  e = RB_INSERT_SORTED(ls, lang_str_ele_skel, link, _lang_cmp);
   if (!e) {
-    skel->str = strdup(str);
-    skel = NULL;
+    lang_str_ele_skel->str = strdup(str);
+    SKEL_USED(lang_str_ele_skel);
     save = 1;
 
   /* Append */
@@ -156,36 +160,106 @@ int lang_str_append
   return _lang_str_add(ls, str, lang, 0, 1);
 }
 
-/* Serialize */
-void lang_str_serialize ( lang_str_t *ls, htsmsg_t *m, const char *f )
+/* Serialize  map */
+htsmsg_t *lang_str_serialize_map ( lang_str_t *ls )
 {
   lang_str_ele_t *e;
-  if (!ls) return;
+  if (!ls) return NULL;
   htsmsg_t *a = htsmsg_create_map();
   RB_FOREACH(e, ls, link) {
     htsmsg_add_str(a, e->lang, e->str);
   }
-  htsmsg_add_msg(m, f, a);
+  return a;
+}
+
+/* Serialize */
+void lang_str_serialize ( lang_str_t *ls, htsmsg_t *m, const char *f )
+{
+  if (!ls) return;
+  htsmsg_add_msg(m, f, lang_str_serialize_map(ls));
+}
+
+/* De-serialize map */
+lang_str_t *lang_str_deserialize_map ( htsmsg_t *map )
+{
+  lang_str_t *ret = lang_str_create();
+  htsmsg_field_t *f;
+  const char *str;
+
+  HTSMSG_FOREACH(f, map) {
+    if ((str = htsmsg_field_get_string(f))) {
+      lang_str_add(ret, str, f->hmf_name, 0);
+    }
+  }
+  return ret;
 }
 
 /* De-serialize */
 lang_str_t *lang_str_deserialize ( htsmsg_t *m, const char *n )
 {
-  lang_str_t *ret = NULL;
   htsmsg_t *a;
-  htsmsg_field_t *f;
   const char *str;
   
   if ((a = htsmsg_get_map(m, n))) {
-    ret = lang_str_create();
-    HTSMSG_FOREACH(f, a) {
-      if ((str = htsmsg_field_get_string(f))) {
-        lang_str_add(ret, str, f->hmf_name, 0);
-      }
-    }
+    return lang_str_deserialize_map(a);
   } else if ((str = htsmsg_get_str(m, n))) {
-    ret = lang_str_create();
+    lang_str_t *ret = lang_str_create();
     lang_str_add(ret, str, NULL, 0);
+    return ret;
   }
-  return ret;
+  return NULL;
+}
+
+/* Compare */
+int lang_str_compare( lang_str_t *ls1, lang_str_t *ls2 )
+{
+  lang_str_ele_t *e;
+  const char *s1, *s2;
+  int r;
+
+  if (ls1 == NULL && ls2)
+    return -1;
+  if (ls2 == NULL && ls1)
+    return 1;
+  if (ls1 == ls2)
+    return 0;
+  /* Note: may be optimized to not check languages twice */
+  RB_FOREACH(e, ls1, link) {
+    s1 = lang_str_get(ls1, e->lang);
+    s2 = lang_str_get(ls2, e->lang);
+    if (s1 == NULL && s2 != NULL)
+      return -1;
+    if (s2 == NULL && s1 != NULL)
+      return 1;
+    if (s1 == NULL || s2 == NULL)
+      continue;
+    r = strcmp(s1, s2);
+    if (r) return r;
+  }
+  RB_FOREACH(e, ls2, link) {
+    s1 = lang_str_get(ls1, e->lang);
+    s2 = lang_str_get(ls2, e->lang);
+    if (s1 == NULL && s2 != NULL)
+      return -1;
+    if (s2 == NULL && s1 != NULL)
+      return 1;
+    if (s1 == NULL || s2 == NULL)
+      continue;
+    r = strcmp(s1, s2);
+    if (r) return r;
+  }
+  return 0;
+}
+
+int strempty(const char* c) {
+  return !c || c[0] == 0;
+}
+
+int lang_str_empty(lang_str_t* str) {
+  return strempty(lang_str_get(str, NULL));
+}
+
+void lang_str_done( void )
+{
+  SKEL_FREE(lang_str_ele_skel);
 }

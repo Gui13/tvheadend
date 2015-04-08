@@ -51,6 +51,15 @@ htsbuf_queue_alloc(unsigned int maxsize)
   return hq;
 }
 
+/**
+ *
+ */
+void
+htsbuf_queue_free(htsbuf_queue_t *hq)
+{
+  htsbuf_queue_flush(hq);
+  free(hq);
+}
 
 /**
  *
@@ -245,8 +254,8 @@ htsbuf_vqprintf(htsbuf_queue_t *hq, const char *fmt, va_list ap0)
   char buf[100], *p, *np;
 
   va_copy(ap, ap0);
-
   n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
   if(n > -1 && n < sizeof(buf)) {
     htsbuf_append(hq, buf, n);
     return;
@@ -260,6 +269,7 @@ htsbuf_vqprintf(htsbuf_queue_t *hq, const char *fmt, va_list ap0)
     /* Try to print in the allocated space. */
     va_copy(ap, ap0);
     n = vsnprintf(p, size, fmt, ap);
+    va_end(ap);
     if(n > -1 && n < size) {
       htsbuf_append_prealloc(hq, p, n);
       return;
@@ -384,6 +394,7 @@ htsbuf_append_and_escape_url(htsbuf_queue_t *hq, const char *s)
 
   while(1) {
     const char *esc;
+    char buf[4];
     C = *c++;
     
     if((C >= '0' && C <= '9') ||
@@ -396,7 +407,6 @@ htsbuf_append_and_escape_url(htsbuf_queue_t *hq, const char *s)
       esc = NULL;
     } else {
       static const char hexchars[16] = "0123456789ABCDEF";
-      char buf[4];
       buf[0] = '%';
       buf[1] = hexchars[(C >> 4) & 0xf];
       buf[2] = hexchars[C & 0xf];;

@@ -32,6 +32,7 @@
 #include "tvheadend.h"
 #include "channels.h"
 #include "spawn.h"
+#include "file.h"
 #include "htsstr.h"
 
 #include "lang_str.h"
@@ -67,7 +68,8 @@ static time_t _xmltv_str2time(const char *in)
   char str[32];
 
   memset(&tm, 0, sizeof(tm));
-  strcpy(str, in);
+  strncpy(str, in, sizeof(str));
+  str[sizeof(str)-1] = '\0';
 
   /* split tz */
   while (str[sp] && str[sp] != ' ')
@@ -79,9 +81,6 @@ static time_t _xmltv_str2time(const char *in)
     sscanf(str+sp+1, "%d", &tz);
     tz = (tz % 100) + (tz / 100) * 3600; // Convert from HHMM to seconds
     str[sp] = 0;
-    sp = 1;
-  } else {
-    sp = 0;
   }
 
   /* parse time */
@@ -95,10 +94,7 @@ static time_t _xmltv_str2time(const char *in)
   tm.tm_isdst = -1;
 
   if (r >= 5) {
-    if(sp)
-      return timegm(&tm) - tz;
-    else
-      return mktime(&tm);
+    return timegm(&tm) - tz;
   } else {
     return 0;
   }
@@ -184,8 +180,8 @@ static const char *xmltv_ns_get_parse_num
 
 
  out:
-  if(ap) *ap = a + 1;
-  if(bp) *bp = b + 1;
+  if(ap && a >= 0) *ap = a + 1;
+  if(bp && b >= 0) *bp = b;
   return s;
 }
 
@@ -215,12 +211,12 @@ static void parse_xmltv_dd_progid
 
   /* Episode */
   if (!strncmp("EP", s, 2)) {
-    int e = strlen(buf);
-    while (e && s[e] != '.') e--;
+    int e = strlen(buf)-1;
+    while (e && buf[e] != '.') e--;
     if (e) {
       buf[e] = '\0';
       *suri = strdup(buf);
-      if (s[e+1]) sscanf(s+e+1, "%hu", &(epnum->e_num));
+      if (buf[e+1]) sscanf(&buf[e+1], "%hu", &(epnum->e_num));
     }
   }
 }
@@ -352,16 +348,67 @@ static int _xmltv_parse_previously_shown
 
 /*
  * Star rating
+ *   <star-rating>
+ *     <value>3.3/5</value>
+ *   </star-rating>
  */
 static int _xmltv_parse_star_rating
-  ( epggrab_module_t *mod, epg_episode_t *ee, htsmsg_t *tags )
+  ( epggrab_module_t *mod, epg_episode_t *ee, htsmsg_t *body )
 {
-  int a, b;
-  const char *stars;
-  if (!mod || !ee || !tags) return 0;
-  if (!(stars = htsmsg_xml_get_cdata_str(tags, "star-rating"))) return 0;
-  if (sscanf(stars, "%d/%d", &a, &b) != 2) return 0;
-  return epg_episode_set_star_rating(ee, (5 * a) / b, mod);
+  double a, b;
+  htsmsg_t *stars, *tags;
+  const char *s1, *s2;
+  char *s1end, *s2end;
+
+  if (!mod || !ee || !body) return 0;
+  if (!(stars = htsmsg_get_map(body, "star-rating"))) return 0;
+  if (!(tags  = htsmsg_get_map(stars, "tags"))) return 0;
+  if (!(s1 = htsmsg_xml_get_cdata_str(tags, "value"))) return 0;
+  if (!(s2 = strstr(s1, "/"))) return 0;
+
+  a = strtod(s1, &s1end);
+  b = strtod(s2 + 1, &s2end);
+  if ( a == 0.0f || b == 0.0f) return 0;
+
+  return epg_episode_set_star_rating(ee, (100 * a) / b, mod);
+}
+
+/*
+ * Tries to get age ratingform <rating> element.
+ * Expects integer representing minimal age of watcher.
+ * Other rating types (non-integer, for example MPAA or VCHIP) are ignored.
+ *
+ * Attribute system is ignored.
+ *
+ * Working example:
+ * <rating system="pl"><value>16</value></rating>
+ *
+ * Currently non-working example:
+ *    <rating system="MPAA">
+ *     <value>PG</value>
+ *     <icon src="pg_symbol.png" />
+ *   </rating>
+ *
+ * TODO - support for other rating systems:
+ * [rating system=VCHIP] values TV-PG, TV-G, etc
+ * [rating system=MPAA] values R, PG, G, PG-13 etc
+ * [rating system=advisory] values "strong sexual content","Language", etc
+ */
+static int _xmltv_parse_age_rating
+  ( epggrab_module_t *mod, epg_episode_t *ee, htsmsg_t *body )
+{
+  uint8_t age;
+  htsmsg_t *rating, *tags;
+  const char *s1;
+
+  if (!mod || !ee || !body) return 0;
+  if (!(rating = htsmsg_get_map(body, "rating"))) return 0;
+  if (!(tags  = htsmsg_get_map(rating, "tags"))) return 0;
+  if (!(s1 = htsmsg_xml_get_cdata_str(tags, "value"))) return 0;
+
+  age = atoi(s1);
+
+  return epg_episode_set_age_rating(ee, age, mod);
 }
 
 /*
@@ -501,8 +548,7 @@ static int _xmltv_parse_programme_tags
 
     save3 |= _xmltv_parse_star_rating(mod, ee, tags);
 
-
-    // TODO: parental rating
+    save3 |= _xmltv_parse_age_rating(mod, ee, tags);
   }
 
   /* Stats */
@@ -545,8 +591,8 @@ static int _xmltv_parse_programme
 
   if(stop <= start || stop <= dispatch_clock) return 0;
 
-  LIST_FOREACH(ecl, &ch->channels, link)
-    save |= _xmltv_parse_programme_tags(mod, ecl->channel, tags,
+  LIST_FOREACH(ecl, &ch->channels, ecl_epg_link)
+    save |= _xmltv_parse_programme_tags(mod, ecl->ecl_channel, tags,
                                         start, stop, stats);
   return save;
 }
@@ -630,14 +676,17 @@ static int _xmltv_parse
 
 static void _xmltv_load_grabbers ( void )
 {
-  int outlen;
+  int outlen = -1, rd = -1;
   size_t i, p, n;
   char *outbuf;
   char name[1000];
   char *tmp, *tmp2 = NULL, *path;
 
   /* Load data */
-  outlen = spawn_and_store_stdout(XMLTV_FIND, NULL, &outbuf);
+  if (spawn_and_give_stdout(XMLTV_FIND, NULL, NULL, &rd, NULL, 1) >= 0)
+    outlen = file_readall(rd, &outbuf);
+  if (rd >= 0)
+    close(rd);
 
   /* Process */
   if ( outlen > 0 ) {
@@ -647,8 +696,13 @@ static void _xmltv_load_grabbers ( void )
         outbuf[i] = '\0';
         sprintf(name, "XMLTV: %s", &outbuf[n]);
         epggrab_module_int_create(NULL, &outbuf[p], name, 3, &outbuf[p],
-                                NULL, _xmltv_parse, NULL, NULL);
+                                  NULL, _xmltv_parse, NULL, NULL);
         p = n = i + 1;
+      } else if ( outbuf[i] == '\\') {
+        memmove(outbuf, outbuf + 1, strlen(outbuf));
+        if (outbuf[i])
+          i++;
+        continue;
       } else if ( outbuf[i] == '|' ) {
         outbuf[i] = '\0';
         n = i + 1;
@@ -659,12 +713,11 @@ static void _xmltv_load_grabbers ( void )
 
   /* Internal search */
   } else if ((tmp = getenv("PATH"))) {
-    tvhlog(LOG_DEBUG, "epggrab", "using internal grab search");
+    tvhdebug("epggrab", "using internal grab search");
     char bin[256];
-    char desc[] = "--description";
     char *argv[] = {
       NULL,
-      desc,
+      (char *)"--description",
       NULL
     };
     path = strdup(tmp);
@@ -681,12 +734,18 @@ static void _xmltv_load_grabbers ( void )
           if (stat(bin, &st)) continue;
           if (!(st.st_mode & S_IEXEC)) continue;
           if (!S_ISREG(st.st_mode)) continue;
-          if ((outlen = spawn_and_store_stdout(bin, argv, &outbuf)) > 0) {
+          rd = -1;
+          if (spawn_and_give_stdout(bin, argv, NULL, &rd, NULL, 1) >= 0 &&
+              (outlen = file_readall(rd, &outbuf)) > 0) {
+            close(rd);
             if (outbuf[outlen-1] == '\n') outbuf[outlen-1] = '\0';
             snprintf(name, sizeof(name), "XMLTV: %s", outbuf);
             epggrab_module_int_create(NULL, bin, name, 3, bin,
                                       NULL, _xmltv_parse, NULL, NULL);
             free(outbuf);
+          } else {
+            if (rd >= 0)
+              close(rd);
           }
         }
         closedir(dir);
@@ -699,6 +758,8 @@ static void _xmltv_load_grabbers ( void )
 
 void xmltv_init ( void )
 {
+  RB_INIT(&_xmltv_channels);
+
   /* External module */
   _xmltv_module = (epggrab_module_t*)
     epggrab_module_ext_create(NULL, "xmltv", "XMLTV", 3, "xmltv",
@@ -707,6 +768,11 @@ void xmltv_init ( void )
 
   /* Standard modules */
   _xmltv_load_grabbers();
+}
+
+void xmltv_done ( void )
+{
+  epggrab_channel_flush(&_xmltv_channels, 0);
 }
 
 void xmltv_load ( void )

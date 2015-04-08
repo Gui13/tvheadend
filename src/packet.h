@@ -1,5 +1,5 @@
 /*
- *  Packet nanagement
+ *  Packet management
  *  Copyright (C) 2008 Andreas Öman
  *
  *  This program is free software: you can redistribute it and/or modify
@@ -19,14 +19,16 @@
 #ifndef PACKET_H_
 #define PACKET_H_
 
+/**
+ * Packet buffer
+ */
 
 typedef struct pktbuf {
   int pb_refcount;
+  int pb_err;
   uint8_t *pb_data;
   size_t pb_size;
 } pktbuf_t;
-
-
 
 /**
  * Packets
@@ -35,6 +37,14 @@ typedef struct pktbuf {
 #define PKT_P_FRAME 2
 #define PKT_B_FRAME 3
 #define PKT_NTYPES  4 
+
+static inline char pkt_frametype_to_char ( int frametype )
+{
+  if (frametype == PKT_I_FRAME) return 'I';
+  if (frametype == PKT_P_FRAME) return 'P';
+  if (frametype == PKT_B_FRAME) return 'B';
+  return ' ';
+}
 
 typedef struct th_pkt {
   int64_t pkt_dts;
@@ -49,13 +59,14 @@ typedef struct th_pkt {
 
   uint8_t pkt_channels;
   uint8_t pkt_sri;
+  uint8_t pkt_ext_sri;
   uint8_t pkt_err;
 
   uint16_t pkt_aspect_num;
   uint16_t pkt_aspect_den;
 
+  pktbuf_t *pkt_meta;
   pktbuf_t *pkt_payload;
-  pktbuf_t *pkt_header;
 
 } th_pkt_t;
 
@@ -88,21 +99,25 @@ void pktref_remove(struct th_pktref_queue *q, th_pktref_t *pr);
 
 th_pkt_t *pkt_alloc(const void *data, size_t datalen, int64_t pts, int64_t dts);
 
-th_pkt_t *pkt_merge_header(th_pkt_t *pkt);
-
 th_pkt_t *pkt_copy_shallow(th_pkt_t *pkt);
 
 th_pktref_t *pktref_create(th_pkt_t *pkt);
 
+/*
+ *
+ */
+
 void pktbuf_ref_dec(pktbuf_t *pb);
 
-void pktbuf_ref_inc(pktbuf_t *pb);
+pktbuf_t *pktbuf_ref_inc(pktbuf_t *pb);
 
 pktbuf_t *pktbuf_alloc(const void *data, size_t size);
 
 pktbuf_t *pktbuf_make(void *data, size_t size);
 
-#define pktbuf_len(pb) ((pb)->pb_size)
-#define pktbuf_ptr(pb) ((pb)->pb_data)
+pktbuf_t *pktbuf_append(pktbuf_t *pb, const void *data, size_t size);
+
+static inline size_t   pktbuf_len(pktbuf_t *pb) { return pb ? pb->pb_size : 0; }
+static inline uint8_t *pktbuf_ptr(pktbuf_t *pb) { return pb->pb_data; }
 
 #endif /* PACKET_H_ */

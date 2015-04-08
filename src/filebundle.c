@@ -24,7 +24,11 @@
 #include <string.h>
 #include <stdio.h>
 #if ENABLE_ZLIB
+#define ZLIB_CONST 1
 #include <zlib.h>
+#ifndef z_const
+#define z_const
+#endif
 #endif
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -78,18 +82,16 @@ static uint8_t *_fb_inflate ( const uint8_t *data, size_t size, size_t orig )
 {
   int err;
   z_stream zstr;
-  uint8_t *bufin, *bufout;
+  uint8_t *bufout;
 
   /* Setup buffers */
-  bufin  = malloc(size);
   bufout = malloc(orig);
-  memcpy(bufin, data, size);
 
   /* Setup zlib */
   memset(&zstr, 0, sizeof(zstr));
   inflateInit2(&zstr, 31);
   zstr.avail_in  = size;
-  zstr.next_in   = bufin;
+  zstr.next_in   = (z_const uint8_t *)data;
   zstr.avail_out = orig;
   zstr.next_out  = bufout;
     
@@ -99,7 +101,6 @@ static uint8_t *_fb_inflate ( const uint8_t *data, size_t size, size_t orig )
     free(bufout);
     bufout = NULL;
   }
-  free(bufin);
   inflateEnd(&zstr);
   
   return bufout;
@@ -111,30 +112,40 @@ static uint8_t *_fb_deflate ( const uint8_t *data, size_t orig, size_t *size )
 {
   int err;
   z_stream zstr;
-  uint8_t *bufin, *bufout;
+  uint8_t *bufout;
 
   /* Setup buffers */
-  bufin  = malloc(orig);
   bufout = malloc(orig);
-  memcpy(bufin, data, orig);
 
   /* Setup zlib */
   memset(&zstr, 0, sizeof(zstr));
   err = deflateInit2(&zstr, 9, Z_DEFLATED, 31, 9, Z_DEFAULT_STRATEGY);
   zstr.avail_in  = orig;
-  zstr.next_in   = bufin;
+  zstr.next_in   = (z_const uint8_t *)data;
   zstr.avail_out = orig;
   zstr.next_out  = bufout;
     
   /* Decompress */
-  err = deflate(&zstr, Z_FINISH);
-  if ( (err != Z_STREAM_END && err != Z_OK) || zstr.total_out == 0 ) {
-    free(bufout);
-    bufout = NULL;
-  } else {
-    *size  = zstr.total_out;
+  while (1) {
+    err = deflate(&zstr, Z_FINISH);
+
+    /* Need more space */
+    if (err == Z_OK && zstr.avail_out == 0) {
+      bufout         = realloc(bufout, zstr.total_out * 2);
+      zstr.avail_out = zstr.total_out;
+      zstr.next_out  = bufout + zstr.total_out;
+      continue;
+    }
+
+    /* Error */
+    if ( (err != Z_STREAM_END && err != Z_OK) || zstr.total_out == 0 ) {
+      free(bufout);
+      bufout = NULL;
+    } else {
+      *size  = zstr.total_out;
+    }
+    break;
   }
-  free(bufin);
   deflateEnd(&zstr);
   
   return bufout;
@@ -267,7 +278,8 @@ fb_dirent *fb_readdir ( fb_dir *dir )
   fb_dirent *ret = NULL;
   if (dir->type == FB_BUNDLE) {
     if (dir->b.cur) {
-      strcpy(dir->dirent.name, dir->b.cur->name);
+      strncpy(dir->dirent.name, dir->b.cur->name, sizeof(dir->dirent.name)-1);
+      dir->dirent.name[sizeof(dir->dirent.name)-1] = '\0';
       dir->dirent.type = dir->b.cur->type;
       dir->b.cur       = dir->b.cur->next;
       ret              = &dir->dirent;
@@ -300,13 +312,27 @@ int fb_scandir ( const char *path, fb_dirent ***list )
 
   /* Direct */
   if (dir->type == FB_DIRECT) {
-    if ((ret = scandir(dir->d.root, &de, NULL, NULL)) != -1) {
-      if (ret == 0) return 0;
+    if ((ret = scandir(dir->d.root, &de, NULL, NULL)) > 0) {
       *list = malloc(sizeof(fb_dirent*)*ret);
       for (i = 0; i < ret; i++) {
         (*list)[i] = calloc(1, sizeof(fb_dirent));
         strcpy((*list)[i]->name, de[i]->d_name);
-        (*list)[i]->type = FB_DIRECT;
+        switch(de[i]->d_type) {
+          case DT_DIR: 
+            (*list)[i]->type = FB_DIR;
+            break;
+          case DT_REG:
+            (*list)[i]->type = FB_FILE;
+            break;
+          default: {
+            struct stat st;
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s/%s", dir->d.root, de[i]->d_name);
+            if (!lstat(buf, &st))
+              (*list)[i]->type = S_ISDIR(st.st_mode) ? FB_DIR : FB_FILE;
+            break;
+          }
+        }
         free(de[i]);
       }
       free(de);
@@ -317,11 +343,12 @@ int fb_scandir ( const char *path, fb_dirent ***list )
     const filebundle_entry_t *fb;
     ret = dir->b.root->d.count;
     fb  = dir->b.root->d.child;
-    *list = malloc(ret * sizeof(fb_dirent));
+    *list = malloc(ret * sizeof(fb_dirent*));
     i = 0;
     while (fb) {
       (*list)[i] = calloc(1, sizeof(fb_dirent));
-      strcpy((*list)[i]->name, fb->name);
+      strncpy((*list)[i]->name, fb->name, sizeof((*list)[i]->name));
+      (*list)[i]->name[sizeof((*list)[i]->name)-1] = '\0';
       fb = fb->next;
       i++;
     }
@@ -384,10 +411,10 @@ fb_file *fb_open2
   } else {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", dir->d.root, name);
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = tvh_fopen(path, "rb");
     if (fp) {
       struct stat st;
-      lstat(path, &st);
+      stat(path, &st);
       ret         = calloc(1, sizeof(fb_file));
       ret->type   = FB_DIRECT;
       ret->size   = st.st_size;

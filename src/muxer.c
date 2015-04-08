@@ -17,13 +17,22 @@
  */
 
 #include <string.h>
+#include <fcntl.h>
 
 #include "tvheadend.h"
 #include "service.h"
 #include "muxer.h"
-#include "muxer_tvh.h"
-#include "muxer_pass.h"
+#include "muxer/muxer_tvh.h"
+#include "muxer/muxer_pass.h"
+#if CONFIG_LIBAV
+#include "muxer/muxer_libav.h"
+#endif
 
+#if defined(PLATFORM_DARWIN)
+#define fdatasync(fd)       fcntl(fd, F_FULLFSYNC)
+#elif defined(PLATFORM_FREEBSD)
+#define fdatasync(fd)       fsync(fd)
+#endif
 
 /**
  * Mime type for containers containing only audio
@@ -31,9 +40,13 @@
 static struct strtab container_audio_mime[] = {
   { "application/octet-stream", MC_UNKNOWN },
   { "audio/x-matroska",         MC_MATROSKA },
+  { "audio/x-matroska",         MC_AVMATROSKA },
+  { "audio/webm",               MC_WEBM },
+  { "audio/webm",               MC_AVWEBM },
   { "audio/x-mpegts",           MC_MPEGTS },
   { "audio/mpeg",               MC_MPEGPS },
   { "application/octet-stream", MC_PASS },
+  { "application/octet-stream", MC_RAW },
 };
 
 
@@ -43,9 +56,13 @@ static struct strtab container_audio_mime[] = {
 static struct strtab container_video_mime[] = {
   { "application/octet-stream", MC_UNKNOWN },
   { "video/x-matroska",         MC_MATROSKA },
+  { "video/x-matroska",         MC_AVMATROSKA },
+  { "video/webm",               MC_WEBM },
+  { "video/webm",               MC_AVWEBM },
   { "video/x-mpegts",           MC_MPEGTS },
   { "video/mpeg",               MC_MPEGPS },
   { "application/octet-stream", MC_PASS },
+  { "application/octet-stream", MC_RAW },
 };
 
 
@@ -53,11 +70,15 @@ static struct strtab container_video_mime[] = {
  * Name of the container
  */
 static struct strtab container_name[] = {
-  { "unknown",  MC_UNKNOWN },
-  { "matroska", MC_MATROSKA },
-  { "mpegts",   MC_MPEGTS },
-  { "mpegps",   MC_MPEGPS },
-  { "pass",     MC_PASS },
+  { "unknown",    MC_UNKNOWN },
+  { "matroska",   MC_MATROSKA },
+  { "webm",       MC_WEBM },
+  { "mpegts",     MC_MPEGTS },
+  { "mpegps",     MC_MPEGPS },
+  { "pass",       MC_PASS },
+  { "raw",        MC_RAW },
+  { "avmatroska", MC_AVMATROSKA },
+  { "avwebm",     MC_AVWEBM },
 };
 
 
@@ -67,9 +88,13 @@ static struct strtab container_name[] = {
 static struct strtab container_audio_file_suffix[] = {
   { "bin",  MC_UNKNOWN },
   { "mka",  MC_MATROSKA },
+  { "webm", MC_WEBM },
   { "ts",   MC_MPEGTS },
   { "mpeg", MC_MPEGPS },
   { "bin",  MC_PASS },
+  { "bin",  MC_RAW },
+  { "mka",  MC_AVMATROSKA },
+  { "webm", MC_AVWEBM },
 };
 
 
@@ -79,9 +104,13 @@ static struct strtab container_audio_file_suffix[] = {
 static struct strtab container_video_file_suffix[] = {
   { "bin",  MC_UNKNOWN },
   { "mkv",  MC_MATROSKA },
+  { "webm", MC_WEBM },
   { "ts",   MC_MPEGTS },
   { "mpeg", MC_MPEGPS },
   { "bin",  MC_PASS },
+  { "bin",  MC_RAW },
+  { "mkv",  MC_AVMATROSKA },
+  { "webm", MC_AVWEBM },
 };
 
 
@@ -185,35 +214,32 @@ muxer_container_mime2type(const char *str)
  * Create a new muxer
  */
 muxer_t* 
-muxer_create(muxer_container_type_t mc)
+muxer_create(const muxer_config_t *m_cfg)
 {
   muxer_t *m;
 
-  m = pass_muxer_create(mc);
+  assert(m_cfg);
+
+  m = pass_muxer_create(m_cfg);
 
   if(!m)
-    m = tvh_muxer_create(mc);
+    m = tvh_muxer_create(m_cfg);
 
+#if CONFIG_LIBAV
   if(!m)
+    m = lav_muxer_create(m_cfg);
+#endif
+
+  if(!m) {
     tvhlog(LOG_ERR, "mux", "Can't find a muxer that supports '%s' container",
-	   muxer_container_type2txt(mc));
+	   muxer_container_type2txt(m_cfg->m_type));
+    return NULL;
+  }
+  
+  memcpy(&m->m_config, m_cfg, sizeof(muxer_config_t));
 
   return m;
 }
-
-
-/**
- * sanity wrapper arround m_mime()
- */
-const char*
-muxer_mime(muxer_t *m,  const struct streaming_start *ss)
-{
-  if(!m || !ss)
-    return NULL;
-
-  return m->m_mime(m, ss);
-}
-
 
 /**
  * Figure out the file suffix by looking at the mime type
@@ -235,109 +261,77 @@ muxer_suffix(muxer_t *m,  const struct streaming_start *ss)
   return muxer_container_suffix(mc, video);
 }
 
-
 /**
- * sanity wrapper arround m_init()
+ * cache type conversions
  */
-int
-muxer_init(muxer_t *m, const struct streaming_start *ss, const char *name)
-{
-  if(!m || !ss)
-    return -1;
+static struct strtab cache_types[] = {
+  { "Unknown",            MC_CACHE_UNKNOWN },
+  { "System",             MC_CACHE_SYSTEM },
+  { "Do not keep",        MC_CACHE_DONTKEEP },
+  { "Sync",               MC_CACHE_SYNC },
+  { "Sync + Do not keep", MC_CACHE_SYNCDONTKEEP }
+};
 
-  return m->m_init(m, ss, name);
+const char*
+muxer_cache_type2txt(muxer_cache_type_t c)
+{
+  return val2str(c, cache_types);
 }
 
-
-/**
- * sanity wrapper arround m_reconfigure()
- */
-int
-muxer_reconfigure(muxer_t *m, const struct streaming_start *ss)
+muxer_cache_type_t
+muxer_cache_txt2type(const char *str)
 {
-  if(!m || !ss)
-    return -1;
-
-  return m->m_reconfigure(m, ss);
-}
-
-
-/**
- * sanity wrapper arround m_open_file()
- */
-int
-muxer_open_file(muxer_t *m, const char *filename)
-{
-  if(!m || !filename)
-    return -1;
-
-  return m->m_open_file(m, filename);
-}
-
-
-/**
- * sanity wrapper arround m_open_stream()
- */
-int
-muxer_open_stream(muxer_t *m, int fd)
-{
-  if(!m || fd < 0)
-    return -1;
-
-  return m->m_open_stream(m, fd);
-}
-
-
-/**
- * sanity wrapper arround m_close()
- */
-int
-muxer_close(muxer_t *m)
-{
-  if(!m)
-    return -1;
-
-  return m->m_close(m);
+  int r = str2val(str, cache_types);
+  if (r < 0)
+    r = MC_CACHE_UNKNOWN;
+  return r;
 }
 
 /**
- * sanity wrapper arround m_destroy()
+ * cache scheme
  */
-int
-muxer_destroy(muxer_t *m)
+void
+muxer_cache_update(muxer_t *m, int fd, off_t pos, size_t size)
 {
-  if(!m)
-    return -1;
-
-  m->m_destroy(m);
-
-  return 0;
+  switch (m->m_config.m_cache) {
+  case MC_CACHE_UNKNOWN:
+  case MC_CACHE_SYSTEM:
+    break;
+  case MC_CACHE_SYNC:
+    fdatasync(fd);
+    break;
+  case MC_CACHE_SYNCDONTKEEP:
+    fdatasync(fd);
+    /* fall through */
+  case MC_CACHE_DONTKEEP:
+#if defined(PLATFORM_DARWIN)
+    fcntl(fd, F_NOCACHE, 1);
+#elif !defined(ENABLE_ANDROID)
+    posix_fadvise(fd, pos, size, POSIX_FADV_DONTNEED);
+#endif
+    break;
+  default:
+    abort();
+  }
 }
-
 
 /**
- * sanity wrapppper arround m_write_meta()
+ * Get a list of supported cache schemes
  */
 int
-muxer_write_meta(muxer_t *m, struct epg_broadcast *eb)
+muxer_cache_list(htsmsg_t *array)
 {
-  if(!m || !eb)
-    return -1;
+  htsmsg_t *mc;
+  int c;
+  const char *s;
 
-  return m->m_write_meta(m, eb);
+  for (c = 0; c <= MC_CACHE_LAST; c++) {
+    mc = htsmsg_create_map();
+    s = muxer_cache_type2txt(c);
+    htsmsg_add_u32(mc, "index",       c);
+    htsmsg_add_str(mc, "description", s);
+    htsmsg_add_msg(array, NULL, mc);
+  }
+
+  return c;
 }
-
-
-/**
- * sanity wrapper arround m_write_pkt()
- */
-int
-muxer_write_pkt(muxer_t *m, streaming_message_type_t smt, void *data)
-{
-  if(!m || !data)
-    return -1;
-
-  return m->m_write_pkt(m, smt, data);
-}
-
-

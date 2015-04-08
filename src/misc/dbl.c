@@ -31,31 +31,32 @@
 double
 my_str2double(const char *str, const char **endp)
 {
-  double ret = 1.0f;
-  int n = 0, m = 0, o = 0, e = 0;
+  double ret = 0.0, t = 0.1;
+  int n = 0, e = 0;
 
+  /* Negative */
   if(*str == '-') {
-    ret = -1.0f;
+    n = 1;
     str++;
   }
 
+  /* Integer */
   while(*str >= '0' && *str <= '9')
-    n = n * 10 + *str++ - '0';
+    ret = ret * 10 + *str++ - '0';
 
-  if(*str != '.') {
-    ret *= n;
-  } else {
-
+  /* Fracton */
+  if(*str == '.') {
     str++;
-
     while(*str >= '0' && *str <= '9') {
-      o = o * 10 + *str++ - '0';
-      m--;
+      ret += (*str++ - '0') * t;
+      t /= 10;
     }
-
-    ret *= (n + pow(10, m) * o);
   }
 
+  /* Negate */
+  if (n) ret *= -1;
+
+  /* Exponential */
   if(*str == 'e' || *str == 'E') {
     int esign = 1;
     str++;
@@ -182,7 +183,9 @@ my_double2str(char *buf, size_t bufsize, double realvalue)
   if( xtype==xGENERIC && precision>0 ) precision--;
   for(idx=precision, rounder=0.5; idx>0; idx--, rounder*=0.1){}
 
+#if 0 /* coverity - dead code 'xtype == xGENERIC' here */
   if( xtype==xFLOAT ) realvalue += rounder;
+#endif
   /* Normalize realvalue to within 10.0 > realvalue >= 1.0 */
   exp = 0;
 
@@ -225,9 +228,12 @@ my_double2str(char *buf, size_t bufsize, double realvalue)
       precision = precision - exp;
       xtype = xFLOAT;
     }
-  }else{
+  }
+#if 0 /* coverity - dead code - xtype == xGENERIC here */
+    else{
     flag_rtz = 0;
   }
+#endif
   if( xtype==xEXP ){
     e2 = 0;
   }else{
@@ -267,9 +273,12 @@ my_double2str(char *buf, size_t bufsize, double realvalue)
     while( bufpt[-1]=='0' ) *(--bufpt) = 0;
     assert( bufpt>buf );
     if( bufpt[-1]=='.' ){
+#if 0 /* coverity - dead code - flag_altform2 == 0 here */
       if( flag_altform2 ){
 	*(bufpt++) = '0';
-      }else{
+      }else
+#endif
+      {
 	*(--bufpt) = 0;
       }
     }

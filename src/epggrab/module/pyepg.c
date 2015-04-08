@@ -94,7 +94,7 @@ static int _pyepg_parse_channel
   if ((str = htsmsg_xml_get_cdata_str(tags, "image")))
     save |= epggrab_channel_set_icon(ch, str);
   if ((!htsmsg_xml_get_cdata_u32(tags, "number", &u32)))
-    save |= epggrab_channel_set_number(ch, u32);
+    save |= epggrab_channel_set_number(ch, u32, 0);
   
   /* Update */
   if (save) {
@@ -365,9 +365,9 @@ static int _pyepg_parse_schedule
 
   HTSMSG_FOREACH(f, tags) {
     if (strcmp(f->hmf_name, "broadcast") == 0) {
-      LIST_FOREACH(ecl, &ec->channels, link)
+      LIST_FOREACH(ecl, &ec->channels, ecl_epg_link)
         save |= _pyepg_parse_broadcast(mod, htsmsg_get_map_by_field(f),
-                                       ecl->channel, stats);
+                                       ecl->ecl_channel, stats);
     }
   }
 
@@ -422,6 +422,8 @@ void pyepg_init ( void )
 {
   char buf[256];
 
+  RB_INIT(&_pyepg_channels);
+
   /* Internal module */
   if (find_exec("pyepg", buf, sizeof(buf)-1))
     epggrab_module_int_create(NULL, "pyepg-internal", "PyEPG", 4, buf,
@@ -432,6 +434,11 @@ void pyepg_init ( void )
     epggrab_module_ext_create(NULL, "pyepg", "PyEPG", 4, "pyepg",
                               _pyepg_parse, NULL,
                               &_pyepg_channels);
+}
+
+void pyepg_done ( void )
+{
+  epggrab_channel_flush(&_pyepg_channels, 0);
 }
 
 void pyepg_load ( void )

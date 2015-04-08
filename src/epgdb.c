@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "tvheadend.h"
 #include "queue.h"
@@ -43,6 +44,7 @@ extern epg_object_tree_t epg_serieslinks;
 /*
  * Use for v1 databases
  */
+#if DEPRECATED
 static void _epgdb_v1_process ( htsmsg_t *c, epggrab_stats_t *stats )
 {
   channel_t *ch;
@@ -93,44 +95,49 @@ static void _epgdb_v1_process ( htsmsg_t *c, epggrab_stats_t *stats )
   /* Set episode */
   save |= epg_broadcast_set_episode(ebc, ee, NULL);
 }
+#endif
 
 /*
  * Process v2 data
  */
-static void _epgdb_v2_process ( htsmsg_t *m, epggrab_stats_t *stats )
+static void
+_epgdb_v2_process( char **sect, htsmsg_t *m, epggrab_stats_t *stats )
 {
   int save = 0;
   const char *s;
-  static char *sect;
 
   /* New section */
   if ( (s = htsmsg_get_str(m, "__section__")) ) {
-    if (sect) free(sect);
-    sect = strdup(s);
+    if (*sect) free(*sect);
+    *sect = strdup(s);
   
   /* Brand */
-  } else if ( !strcmp(sect, "brands") ) {
+  } else if ( !strcmp(*sect, "brands") ) {
     if (epg_brand_deserialize(m, 1, &save)) stats->brands.total++;
       
   /* Season */
-  } else if ( !strcmp(sect, "seasons") ) {
+  } else if ( !strcmp(*sect, "seasons") ) {
     if (epg_season_deserialize(m, 1, &save)) stats->seasons.total++;
 
   /* Episode */
-  } else if ( !strcmp(sect, "episodes") ) {
+  } else if ( !strcmp(*sect, "episodes") ) {
     if (epg_episode_deserialize(m, 1, &save)) stats->episodes.total++;
   
   /* Series link */
-  } else if ( !strcmp(sect, "serieslinks") ) {
+  } else if ( !strcmp(*sect, "serieslinks") ) {
     if (epg_serieslink_deserialize(m, 1, &save)) stats->seasons.total++;
   
   /* Broadcasts */
-  } else if ( !strcmp(sect, "broadcasts") ) {
+  } else if ( !strcmp(*sect, "broadcasts") ) {
     if (epg_broadcast_deserialize(m, 1, &save)) stats->broadcasts.total++;
+
+  /* Global config */
+  } else if ( !strcmp(*sect, "config") ) {
+    if (epg_config_deserialize(m)) stats->config.total++;
 
   /* Unknown */
   } else {
-    tvhlog(LOG_DEBUG, "epgdb", "malformed database section [%s]", sect);
+    tvhlog(LOG_DEBUG, "epgdb", "malformed database section [%s]", *sect);
     //htsmsg_print(m);
   }
 }
@@ -146,6 +153,7 @@ void epg_init ( void )
   uint8_t *mem, *rp;
   epggrab_stats_t stats;
   int ver = EPG_DB_VERSION;
+  char *sect = NULL;
 
   /* Find the right file (and version) */
   while (fd < 0 && ver > 0) {
@@ -181,12 +189,12 @@ void epg_init ( void )
   while ( remain > 4 ) {
 
     /* Get message length */
-    int msglen = (rp[0] << 24) | (rp[1] << 16) | (rp[2] << 8) | rp[3];
+    uint32_t msglen = (rp[0] << 24) | (rp[1] << 16) | (rp[2] << 8) | rp[3];
     remain    -= 4;
     rp        += 4;
 
     /* Safety check */
-    if (msglen > remain) {
+    if ((int64_t)msglen > remain) {
       tvhlog(LOG_ERR, "epgdb", "corruption detected, some/all data lost");
       break;
     }
@@ -204,10 +212,9 @@ void epg_init ( void )
     /* Process */
     switch (ver) {
       case 2:
-        _epgdb_v2_process(m, &stats);
+        _epgdb_v2_process(&sect, m, &stats);
         break;
-      default: /* v0/1 */
-        _epgdb_v1_process(m, &stats);
+      default:
         break;
     }
 
@@ -215,8 +222,19 @@ void epg_init ( void )
     htsmsg_destroy(m);
   }
 
+  free(sect);
+
+  if (!stats.config.total) {
+    htsmsg_t *m = htsmsg_create_map();
+    /* it's not correct, but at least something */
+    htsmsg_add_u32(m, "last_id", 64 * 1024 * 1024);
+    if (!epg_config_deserialize(m))
+      assert(0);
+  }
+
   /* Stats */
   tvhlog(LOG_INFO, "epgdb", "loaded v%d", ver);
+  tvhlog(LOG_INFO, "epgdb", "  config     %d", stats.config.total);
   tvhlog(LOG_INFO, "epgdb", "  channels   %d", stats.channels.total);
   tvhlog(LOG_INFO, "epgdb", "  brands     %d", stats.brands.total);
   tvhlog(LOG_INFO, "epgdb", "  seasons    %d", stats.seasons.total);
@@ -226,6 +244,17 @@ void epg_init ( void )
   /* Close file */
   munmap(mem, st.st_size);
   close(fd);
+}
+
+void epg_done ( void )
+{
+  channel_t *ch;
+
+  pthread_mutex_lock(&global_lock);
+  CHANNEL_FOREACH(ch)
+    epg_channel_unlink(ch);
+  epg_skel_done();
+  pthread_mutex_unlock(&global_lock);
 }
 
 /* **************************************************************************
@@ -247,11 +276,6 @@ static int _epg_write ( int fd, htsmsg_t *m )
   } else {
     ret = 0;
   }
-  if(ret) {
-    tvhlog(LOG_ERR, "epgdb", "failed to store epg to disk");
-    close(fd);
-    hts_settings_remove("epgdb.v%d", EPG_DB_VERSION);
-  }
   return ret;
 }
 
@@ -262,6 +286,11 @@ static int _epg_write_sect ( int fd, const char *sect )
   return _epg_write(fd, m);
 }
 
+void epg_save_callback ( void *p )
+{
+  epg_save();
+}
+
 void epg_save ( void )
 {
   int fd;
@@ -269,38 +298,46 @@ void epg_save ( void )
   epg_broadcast_t *ebc;
   channel_t *ch;
   epggrab_stats_t stats;
+  extern gtimer_t epggrab_save_timer;
+
+  if (epggrab_epgdb_periodicsave)
+    gtimer_arm(&epggrab_save_timer, epg_save_callback, NULL, epggrab_epgdb_periodicsave);
   
   fd = hts_settings_open_file(1, "epgdb.v%d", EPG_DB_VERSION);
+  if (fd < 0)
+    return;
 
   memset(&stats, 0, sizeof(stats));
-  if ( _epg_write_sect(fd, "brands") ) return;
+  if ( _epg_write_sect(fd, "config") ) goto error;
+  if (_epg_write(fd, epg_config_serialize())) goto error;
+  if ( _epg_write_sect(fd, "brands") ) goto error;
   RB_FOREACH(eo,  &epg_brands, uri_link) {
-    if (_epg_write(fd, epg_brand_serialize((epg_brand_t*)eo))) return;
+    if (_epg_write(fd, epg_brand_serialize((epg_brand_t*)eo))) goto error;
     stats.brands.total++;
   }
-  if ( _epg_write_sect(fd, "seasons") ) return;
+  if ( _epg_write_sect(fd, "seasons") ) goto error;
   RB_FOREACH(eo,  &epg_seasons, uri_link) {
-    if (_epg_write(fd, epg_season_serialize((epg_season_t*)eo))) return;
+    if (_epg_write(fd, epg_season_serialize((epg_season_t*)eo))) goto error;
     stats.seasons.total++;
   }
-  if ( _epg_write_sect(fd, "episodes") ) return;
+  if ( _epg_write_sect(fd, "episodes") ) goto error;
   RB_FOREACH(eo,  &epg_episodes, uri_link) {
-    if (_epg_write(fd, epg_episode_serialize((epg_episode_t*)eo))) return;
+    if (_epg_write(fd, epg_episode_serialize((epg_episode_t*)eo))) goto error;
     stats.episodes.total++;
   }
-  if ( _epg_write_sect(fd, "serieslinks") ) return;
+  if ( _epg_write_sect(fd, "serieslinks") ) goto error;
   RB_FOREACH(eo, &epg_serieslinks, uri_link) {
-    if (_epg_write(fd, epg_serieslink_serialize((epg_serieslink_t*)eo)))
-      return;
+    if (_epg_write(fd, epg_serieslink_serialize((epg_serieslink_t*)eo))) goto error;
     stats.seasons.total++;
   }
-  if ( _epg_write_sect(fd, "broadcasts") ) return;
-  RB_FOREACH(ch, &channel_name_tree, ch_name_link) {
+  if ( _epg_write_sect(fd, "broadcasts") ) goto error;
+  CHANNEL_FOREACH(ch) {
     RB_FOREACH(ebc, &ch->ch_epg_schedule, sched_link) {
-      if (_epg_write(fd, epg_broadcast_serialize(ebc))) return;
+      if (_epg_write(fd, epg_broadcast_serialize(ebc))) goto error;
       stats.broadcasts.total++;
     }
   }
+  close(fd);
 
   /* Stats */
   tvhlog(LOG_INFO, "epgdb", "saved");
@@ -308,4 +345,11 @@ void epg_save ( void )
   tvhlog(LOG_INFO, "epgdb", "  seasons    %d", stats.seasons.total);
   tvhlog(LOG_INFO, "epgdb", "  episodes   %d", stats.episodes.total);
   tvhlog(LOG_INFO, "epgdb", "  broadcasts %d", stats.broadcasts.total);
+
+  return;
+
+error:
+  tvhlog(LOG_ERR, "epgdb", "failed to store epg to disk");
+  hts_settings_remove("epgdb.v%d", EPG_DB_VERSION);
+  close(fd);
 }

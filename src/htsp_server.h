@@ -22,9 +22,11 @@
 #include "epg.h"
 #include "dvr/dvr.h"
 
-void htsp_init(void);
+void htsp_init(const char *bindaddr);
+void htsp_register(void);
+void htsp_done(void);
 
-void htsp_channel_update_current(channel_t *ch);
+void htsp_channel_update_nownext(channel_t *ch);
 
 void htsp_channel_add(channel_t *ch);
 void htsp_channel_update(channel_t *ch);
@@ -37,6 +39,14 @@ void htsp_tag_delete(channel_tag_t *ct);
 void htsp_dvr_entry_add(dvr_entry_t *de);
 void htsp_dvr_entry_update(dvr_entry_t *de);
 void htsp_dvr_entry_delete(dvr_entry_t *de);
+
+void htsp_autorec_entry_add(dvr_autorec_entry_t *dae);
+void htsp_autorec_entry_update(dvr_autorec_entry_t *dae);
+void htsp_autorec_entry_delete(dvr_autorec_entry_t *dae);
+
+void htsp_timerec_entry_add(dvr_timerec_entry_t *dte);
+void htsp_timerec_entry_update(dvr_timerec_entry_t *dte);
+void htsp_timerec_entry_delete(dvr_timerec_entry_t *dte);
 
 void htsp_event_add(epg_broadcast_t *ebc);
 void htsp_event_update(epg_broadcast_t *ebc);

@@ -1,77 +1,56 @@
-tvheadend.acleditor = function() {
-	var fm = Ext.form;
+/*
+ * Access Control
+ */
 
-	var enabledColumn = new Ext.grid.CheckColumn({
-		header : "Enabled",
-		dataIndex : 'enabled',
-		width : 60
-	});
+tvheadend.acleditor = function(panel, index)
+{
+    var list = 'enabled,username,password,prefix,' +
+               'webui,admin,' +
+               'streaming,adv_streaming,htsp_streaming,' +
+               'profile,conn_limit,dvr,htsp_dvr,all_dvr,all_rw_dvr,' +
+	       'dvr_config,channel_min,channel_max,channel_tag,comment';
 
-	var streamingColumn = new Ext.grid.CheckColumn({
-		header : "Streaming",
-		dataIndex : 'streaming',
-		width : 100
-	});
-
-	var dvrColumn = new Ext.grid.CheckColumn({
-		header : "Video Recorder",
-		dataIndex : 'dvr',
-		width : 100
-	});
-
-	var dvrallcfgColumn = new Ext.grid.CheckColumn({
-		header : "All Configs (VR)",
-		dataIndex : 'dvrallcfg',
-		width : 100
-	});
-
-	var webuiColumn = new Ext.grid.CheckColumn({
-		header : "Web Interface",
-		dataIndex : 'webui',
-		width : 100
-	});
-
-	var adminColumn = new Ext.grid.CheckColumn({
-		header : "Admin",
-		dataIndex : 'admin',
-		width : 100
-	});
-
-	var cm = new Ext.grid.ColumnModel({
-  defaultSortable: true,
-  columns : [ enabledColumn, {
-		header : "Username",
-		dataIndex : 'username',
-		editor : new fm.TextField({
-			allowBlank : false
-		})
-	}, {
-		header : "Password",
-		dataIndex : 'password',
-		renderer : function(value, metadata, record, row, col, store) {
-			return '<span class="tvh-grid-unset">Hidden</span>';
-		},
-		editor : new fm.TextField({
-			allowBlank : false
-		})
-	}, {
-		header : "Prefix",
-		dataIndex : 'prefix',
-		editor : new fm.TextField({
-			allowBlank : false
-		})
-	}, streamingColumn, dvrColumn, dvrallcfgColumn, webuiColumn, adminColumn, {
-		header : "Comment",
-		dataIndex : 'comment',
-		width : 400,
-		editor : new fm.TextField({})
-	} ]});
-
-	var UserRecord = Ext.data.Record.create([ 'enabled', 'streaming', 'dvr',
-		'dvrallcfg', 'admin', 'webui', 'username', 'prefix', 'password',
-		'comment' ]);
-
-	return new tvheadend.tableEditor('Access control', 'accesscontrol', cm,
-		UserRecord, [ enabledColumn, streamingColumn, dvrColumn, dvrallcfgColumn,
-			webuiColumn, adminColumn ], null, 'config_access.html', 'group');
-}
+    tvheadend.idnode_grid(panel, {
+        url: 'api/access/entry',
+        titleS: 'Access Entry',
+        titleP: 'Access Entries',
+        iconCls: 'group',
+        columns: {
+            enabled:        { width: 120 },
+            username:       { width: 250 },
+            password:       { width: 250 },
+            prefix:         { width: 350 },
+            streaming:      { width: 110 },
+            adv_streaming:  { width: 200 },
+            htsp_streaming: { width: 200 },
+            dvr:            { width: 150 },
+            htsp_dvr:       { width: 150 },
+            all_dvr:        { width: 150 },
+            all_rw_dvr:     { width: 150 },
+            webui:          { width: 140 },
+            admin:          { width: 100 },
+            conn_limit:     { width: 160 },
+            channel_min:    { width: 160 },
+            channel_max:    { width: 160 }
+        },
+        tabIndex: index,
+        edit: {
+            params: {
+                list: list
+            }
+        },
+        add: {
+            url: 'api/access/entry',
+            params: {
+                list: list
+            },
+            create: { }
+        },
+        del: true,
+        move: true,
+        list: list,
+        help: function() {
+            new tvheadend.help('Access Control Entries', 'config_access.html');
+        }
+    });
+};
